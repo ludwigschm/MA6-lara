@@ -461,7 +461,141 @@ class PupilBridge:
         return load, max_size
 
     def estimate_time_offset(self, player: str) -> Optional[float]:
-        self._logger.warning("estimate_time_offset(player=%s) noch nicht implementiert.", player)
+        device = self._devices.get(player)
+        if device is None:
+            self._logger.warning(
+                "Zeitoffset für Spieler %s kann nicht bestimmt werden – kein verbundenes Gerät.",
+                player,
+            )
+            return None
+
+        clock = getattr(device, "clock", None) or getattr(device, "time_sync", None)
+        if clock is None:
+            self._logger.warning(
+                "Gerät %s stellt keine Clock-Schnittstelle für Offset-Schätzung bereit.",
+                player,
+            )
+            return None
+
+        try:
+            measurement = self._measure_clock_offset(clock)
+        except AttributeError:
+            self._logger.warning(
+                "Gerät %s unterstützt keine Roundtrip-Zeitmessung über die Realtime-API.",
+                player,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - depends on external API
+            self._logger.warning(
+                "Roundtrip-Zeitmessung für Spieler %s fehlgeschlagen: %s",
+                player,
+                exc,
+            )
+            return None
+
+        offset_seconds = self._extract_offset_seconds(measurement)
+        if offset_seconds is None:
+            self._logger.warning(
+                "Offset-Messung für Spieler %s lieferte kein verwertbares Ergebnis: %r",
+                player,
+                measurement,
+            )
+            return None
+
+        self._logger.debug(
+            "Zeitoffset für %s geschätzt: %.6fs (Realtime Roundtrip)", player, offset_seconds
+        )
+        return offset_seconds
+
+    def _measure_clock_offset(self, clock: Any) -> Any:
+        """Use the realtime clock interface to perform a roundtrip measurement."""
+
+        call_order = (
+            "measure_time_offset",
+            "estimate_time_offset",
+            "measure_offset",
+            "estimate_offset",
+            "measure_roundtrip",
+            "measure",
+        )
+        kw_variants = (
+            {"sample_count": 8},
+            {"num_samples": 8},
+            {"samples": 8},
+            {},
+        )
+
+        last_error: Exception | None = None
+        for attr in call_order:
+            fn = getattr(clock, attr, None)
+            if not callable(fn):
+                continue
+            for kwargs in kw_variants:
+                try:
+                    return fn(**kwargs)
+                except TypeError:
+                    continue
+                except Exception as exc:  # pragma: no cover - depends on external API
+                    last_error = exc
+                    break
+            if last_error is not None:
+                break
+
+        if last_error is not None:
+            raise last_error
+        raise AttributeError("clock interface exposes no compatible measurement method")
+
+    def _extract_offset_seconds(self, measurement: Any) -> Optional[float]:
+        """Normalise various measurement result formats to seconds."""
+
+        if measurement is None:
+            return None
+
+        if isinstance(measurement, (int, float)):
+            return float(measurement)
+
+        if isinstance(measurement, (list, tuple)):
+            for item in measurement:
+                offset = self._extract_offset_seconds(item)
+                if offset is not None:
+                    return offset
+            return None
+
+        candidates = (
+            ("offset_seconds", 1.0),
+            ("offset_s", 1.0),
+            ("offset", 1.0),
+            ("clock_offset", 1.0),
+            ("dt_seconds", 1.0),
+            ("dt", 1.0),
+            ("delta", 1.0),
+            ("offset_ns", 1e-9),
+            ("clock_offset_ns", 1e-9),
+            ("offset_ms", 1e-3),
+        )
+
+        mapping: Dict[str, Any] = {}
+        if isinstance(measurement, dict):
+            mapping = measurement
+        else:
+            for name, _scale in candidates:
+                if hasattr(measurement, name):
+                    try:
+                        mapping[name] = getattr(measurement, name)
+                    except Exception:  # pragma: no cover - attribute access shouldn't fail
+                        continue
+
+        for name, scale in candidates:
+            value = mapping.get(name)
+            if value is None and not isinstance(measurement, dict):
+                value = getattr(measurement, name, None)
+            if value is None:
+                continue
+            try:
+                return float(value) * scale
+            except (TypeError, ValueError):
+                continue
+
         return None
 
     # ------------------------------------------------------------------
