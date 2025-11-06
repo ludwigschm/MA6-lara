@@ -521,22 +521,56 @@ class TabletopApp(App):
         )
 
     def _monitor_queues(self, _dt: float) -> None:
-        if not self._perf_logging:
-            return
         now = time.monotonic()
         if self._logging_queue is not None and self._logging_queue_maxsize > 0:
             load = self._logging_queue.qsize() / self._logging_queue_maxsize
-            if load >= 0.8 and now - self._last_queue_warning >= 1.0:
+            if (
+                self._perf_logging
+                and load >= 0.8
+                and now - self._last_queue_warning >= 1.0
+            ):
                 log.warning("Logging queue at %.0f%% capacity", load * 100.0)
                 self._last_queue_warning = now
         bridge = self._bridge
+        queue_size: Optional[int] = None
+        queue_capacity: Optional[int] = None
+        connected_players: set[str] = set()
         if bridge is not None:
-            size, capacity = bridge.event_queue_load()
-            if capacity > 0:
-                load = size / capacity
-                if load >= 0.8 and now - self._last_queue_warning >= 1.0:
-                    log.warning("Pupil event queue at %.0f%% capacity", load * 100.0)
-                    self._last_queue_warning = now
+            players_fn = getattr(bridge, "connected_players", None)
+            if callable(players_fn):
+                try:
+                    connected_players = set(players_fn())
+                except Exception:
+                    log.debug("connected_players lookup failed", exc_info=True)
+            load_fn = getattr(bridge, "event_queue_load", None)
+            if callable(load_fn):
+                try:
+                    queue_size, queue_capacity = load_fn()
+                except Exception:
+                    log.debug("event_queue_load lookup failed", exc_info=True)
+                else:
+                    if (
+                        queue_capacity
+                        and queue_capacity > 0
+                        and queue_size is not None
+                        and now - self._last_queue_warning >= 1.0
+                        and queue_size / queue_capacity >= 0.8
+                    ):
+                        log.warning(
+                            "Pupil event queue at %.0f%% capacity",
+                            (queue_size / queue_capacity) * 100.0,
+                        )
+                        self._last_queue_warning = now
+        root = cast(Optional[TabletopRoot], self.root)
+        if root is not None:
+            try:
+                root.update_status_bar(
+                    connected_players=connected_players,
+                    queue_size=queue_size,
+                    queue_capacity=queue_capacity,
+                )
+            except Exception:
+                log.debug("Statusbar update failed", exc_info=True)
 
     def _cancel_event(self, event: Any) -> None:
         if event is None:
@@ -619,9 +653,9 @@ class TabletopApp(App):
             self._frame_log_event = Clock.schedule_interval(
                 self._log_frame_metrics, 10.0
             )
-            self._queue_monitor_event = Clock.schedule_interval(
-                self._monitor_queues, 1.0
-            )
+        self._queue_monitor_event = Clock.schedule_interval(
+            self._monitor_queues, 1.0
+        )
 
     def on_stop(self) -> None:  # pragma: no cover - framework callback
         root = cast(Optional[TabletopRoot], self.root)
@@ -674,6 +708,16 @@ class TabletopApp(App):
                     self._bridge.stop_recording(player)
                 except Exception:  # pragma: no cover - defensive fallback
                     log.exception("Failed to stop recording for %s", player)
+
+        bridge_ref = self._bridge
+        close_fn = getattr(bridge_ref, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+                time.sleep(0.1)
+            except Exception:
+                log.debug("Bridge close failed", exc_info=True)
+        self._bridge = None
 
         super().on_stop()
 

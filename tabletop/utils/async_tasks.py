@@ -24,17 +24,21 @@ class AsyncCallQueue:
         perf_logging: bool = False,
     ) -> None:
         self._name = name
-        self._queue: "queue.Queue[Callable[[], None]]" = queue.Queue(maxsize=maxsize)
+        self._queue: "queue.Queue[Callable[[], None] | object]" = queue.Queue(
+            maxsize=maxsize
+        )
         self._maxsize = maxsize
         self._perf_logging = perf_logging
         self._last_load_log = 0.0
+        self._sentinel: object = object()
+        self._closed = False
         self._worker = threading.Thread(target=self._run, name=name, daemon=True)
         self._worker.start()
 
     def submit(self, fn: Optional[Callable[[], None]]) -> None:
         """Enqueue *fn* for background execution, dropping on saturation."""
 
-        if fn is None:
+        if fn is None or self._closed:
             return
         try:
             self._queue.put_nowait(fn)
@@ -54,18 +58,57 @@ class AsyncCallQueue:
 
         return (self._queue.qsize(), self._maxsize)
 
+    def close(self, *, timeout: float = 2.0) -> None:
+        """Signal the worker thread to stop and drain pending work."""
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._queue.put_nowait(self._sentinel)
+        except queue.Full:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._queue.task_done()
+            self._queue.put(self._sentinel)
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+        self._drain_queue()
+        self._worker = None
+
     # ------------------------------------------------------------------
     def _run(self) -> None:
+        queue_obj = self._queue
+        sentinel = self._sentinel
         while True:
-            fn = self._queue.get()
+            fn = queue_obj.get()
+            if fn is sentinel:
+                queue_obj.task_done()
+                break
             start = time.perf_counter()
             try:
-                fn()
+                callable_fn = fn  # help mypy
+                assert callable(callable_fn)
+                callable_fn()
             except Exception:  # pragma: no cover - defensive fallback
                 log.exception("%s task failed", self._name)
             finally:
-                self._queue.task_done()
+                queue_obj.task_done()
                 if self._perf_logging:
                     duration = (time.perf_counter() - start) * 1000.0
                     if duration >= 5.0:
                         log.debug("%s task took %.2f ms", self._name, duration)
+        self._drain_queue()
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self._queue.task_done()

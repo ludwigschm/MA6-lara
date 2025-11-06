@@ -330,6 +330,31 @@
             padding: 40 * root.scale, 40 * root.scale
             font_size: 64 * root.scale if root.scale else 64
 
+    BoxLayout:
+        id: status_bar_container
+        size_hint: 0.7, None
+        height: 64 * root.scale if root.scale else 64
+        pos_hint: {"center_x": 0.5}
+        y: 20 * root.scale
+        padding: 24 * root.scale, 12 * root.scale
+        spacing: 16 * root.scale
+        canvas.before:
+            Color:
+                rgba: 0.05, 0.05, 0.05, 0.7
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [18 * root.scale if root.scale else 18]
+
+        Label:
+            id: status_bar
+            text: root.status_bar_text
+            color: 1, 1, 1, 1
+            font_size: 28 * root.scale if root.scale else 28
+            halign: 'left'
+            valign: 'middle'
+            text_size: self.size
+
     Label:
         id: round_badge
         size_hint: None, None

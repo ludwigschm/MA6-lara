@@ -353,10 +353,56 @@ class PupilBridge:
             )
         except queue.Full:
             self._logger.warning(
-                "Event-Warteschlange voll – Ereignis %s für Spieler %s verworfen.",
+                "Event-Warteschlange voll – priorisiere Ereignis %s für Spieler %s.",
                 name,
                 player,
             )
+            evicted = self._drop_low_priority_event()
+            if evicted:
+                try:
+                    self._event_q.put_nowait(
+                        (priority_level, next(self._event_sequence), event)
+                    )
+                except queue.Full:
+                    self._logger.warning(
+                        "Event-Warteschlange voll – Ereignis %s für Spieler %s verworfen.",
+                        name,
+                        player,
+                    )
+            else:
+                self._logger.warning(
+                    "Event-Warteschlange voll – Ereignis %s für Spieler %s verworfen.",
+                    name,
+                    player,
+                )
+
+    def _drop_low_priority_event(self) -> bool:
+        """Remove one low-priority event to make room, if available."""
+
+        recovered: list[tuple[int, int, object]] = []
+        evicted = False
+        while True:
+            try:
+                priority_level, sequence, item = self._event_q.get_nowait()
+            except queue.Empty:
+                break
+            if not evicted and priority_level > 0:
+                evicted = True
+                self._event_q.task_done()
+                break
+            recovered.append((priority_level, sequence, item))
+            self._event_q.task_done()
+
+        for entry in recovered:
+            try:
+                self._event_q.put_nowait(entry)
+            except queue.Full:
+                self._logger.debug(
+                    "Event queue refill failed while recovering priority entries"
+                )
+                break
+
+        return evicted
 
     def send_host_mirror(
         self,
