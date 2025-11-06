@@ -55,6 +55,12 @@ def _install_device(bridge, player: str, annotations) -> None:
     bridge._connected.add(player)
 
 
+def _install_clock_device(bridge, player: str, clock) -> None:
+    device = types.SimpleNamespace(clock=clock, name=f"device-{player}")
+    bridge._devices[player] = device
+    bridge._connected.add(player)
+
+
 def test_send_event_emits_marker(neon_bridge):
     annotations = _RecordingAnnotations()
     _install_device(neon_bridge, "p1", annotations)
@@ -112,3 +118,45 @@ def test_transient_error_retries(neon_bridge):
 
     assert annotations.calls == [("ui.retry", {"value": 1})]
     assert annotations._failures == 1
+
+
+def test_estimate_time_offset_prefers_roundtrip_result(neon_bridge, caplog):
+    class _Clock:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def measure_roundtrip(self, sample_count: int = 8) -> dict[str, object]:
+            self.calls.append({"sample_count": sample_count})
+            return {"offset_ns": 1_500_000}
+
+    clock = _Clock()
+    _install_clock_device(neon_bridge, "p1", clock)
+
+    caplog.set_level("DEBUG")
+    offset = neon_bridge.estimate_time_offset("p1")
+
+    assert offset == pytest.approx(0.0015)
+    assert clock.calls == [{"sample_count": 8}]
+    assert any("Zeitoffset für p1" in record.getMessage() for record in caplog.records)
+
+
+def test_estimate_time_offset_handles_missing_clock(neon_bridge, caplog):
+    bridge = neon_bridge
+    bridge._devices["p2"] = types.SimpleNamespace(name="device-p2")
+    bridge._connected.add("p2")
+
+    caplog.set_level("WARNING")
+    assert bridge.estimate_time_offset("p2") is None
+    assert any("Clock-Schnittstelle" in record.getMessage() for record in caplog.records)
+
+
+def test_estimate_time_offset_logs_measurement_failure(neon_bridge, caplog):
+    class _FailingClock:
+        def measure_time_offset(self, **_kwargs) -> float:
+            raise RuntimeError("boom")
+
+    _install_clock_device(neon_bridge, "p3", _FailingClock())
+
+    caplog.set_level("WARNING")
+    assert neon_bridge.estimate_time_offset("p3") is None
+    assert any("Roundtrip-Zeitmessung" in record.getMessage() for record in caplog.records)
