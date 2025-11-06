@@ -9,6 +9,40 @@ sounddevice
 
 pip install kivy pandas numpy opencv-contrib-python sounddevice
 
+## Eye-Tracking aktivieren
+
+1. Echtzeit-API installieren:
+
+   ```bash
+   pip install pupil-labs-realtime-api
+   ```
+
+2. Tracker-Hosts hinterlegen. Entweder eine Datei `tracker_hosts.txt` im
+   Projektverzeichnis anlegen oder die Hosts direkt im UI eintragen.
+
+   Beispielinhalt für `tracker_hosts.txt`:
+
+   ```
+   192.168.0.20
+   192.168.0.21
+   ```
+
+3. Anwendung starten:
+
+   ```bash
+   python bluffing_eyes.py
+   ```
+
+4. Smoke-Test ausführen:
+
+   ```bash
+   python -m scripts.neon_smoke
+   ```
+
+   Im Device-Recording sollten die Marker `fix.start`, `fix.beep` und
+   `trial.start` erscheinen. Die Events werden mit der Gerätezeit gestempelt,
+   Host-Zeitstempel müssen nicht übermittelt werden.
+
 ## Event-Zeitmodell & Refinement
 
 Die Tabletop-App vergibt jetzt für jedes UI-Ereignis sofort eine eindeutige
