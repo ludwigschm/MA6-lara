@@ -31,6 +31,14 @@ class PupilBridge:
 
     # ------------------------------------------------------------------
     # Connection handling
+    def configure_hosts(self, hosts: dict[str, str]) -> None:
+        self._hosts = {str(key): str(value) for key, value in hosts.items()}
+        if self._hosts:
+            formatted = ", ".join(f"{key}={value}" for key, value in sorted(self._hosts.items()))
+            self._logger.info("Tracker-Hosts konfiguriert: %s", formatted)
+        else:
+            self._logger.info("Tracker-Hosts konfiguriert: (leer)")
+
     def connect(self) -> None:
         self._logger.warning("connect() wurde aufgerufen, ist aber noch nicht implementiert.")
 
