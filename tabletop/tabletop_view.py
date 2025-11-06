@@ -153,6 +153,7 @@ class TabletopRoot(FloatLayout):
     user_displays = DictProperty({})
     intro_labels = DictProperty({})
     pause_labels = DictProperty({})
+    status_bar_text = StringProperty("Bridge: -- | Queue: --")
 
     def wid(self, name: str):
         # Liefert das Widget-Objekt oder None, ohne Truthiness auf WeakProxy auszulösen
@@ -338,6 +339,7 @@ class TabletopRoot(FloatLayout):
         if block is not None:
             self._bridge_block = block
         players_snapshot = set(self._bridge_players)
+        self.update_status_bar(connected_players=players_snapshot)
         if players_snapshot and "VP2" not in players_snapshot:
             log.info("Nur VP1 aktiv – VP2 deaktiviert")
 
@@ -574,6 +576,19 @@ class TabletopRoot(FloatLayout):
             except Exception:
                 log.debug("Stoppen des TimeReconciler fehlgeschlagen", exc_info=True)
             self._time_reconciler = None
+        dispatcher = getattr(self, "_bridge_dispatcher", None)
+        close_fn = getattr(dispatcher, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                log.debug("Stoppen der Bridge-Dispatch-Queue fehlgeschlagen", exc_info=True)
+            finally:
+                self._bridge_dispatcher = None
+        try:
+            async_bridge.shutdown()
+        except Exception:
+            log.debug("Async-Bridge Shutdown fehlgeschlagen", exc_info=True)
 
     def send_bridge_event(
         self, name: str, payload: Optional[Dict[str, Any]] = None
@@ -1847,6 +1862,36 @@ class TabletopRoot(FloatLayout):
             display = self.wid_safe(display_id)
             if display is not None:
                 display.text = self.format_user_display_text(vp)
+
+    def update_status_bar(
+        self,
+        *,
+        connected_players: Optional[Iterable[str]] = None,
+        queue_size: Optional[int] = None,
+        queue_capacity: Optional[int] = None,
+    ) -> None:
+        players: list[str] = []
+        if connected_players:
+            try:
+                players = sorted(
+                    {str(player) for player in connected_players if player}
+                )
+            except Exception:
+                players = []
+        size_val = 0 if queue_size is None else int(queue_size)
+        if queue_capacity and queue_capacity > 0:
+            load_pct = size_val / queue_capacity * 100.0
+            queue_part = (
+                f"Queue: {size_val}/{queue_capacity} ({load_pct:.0f}%)"
+            )
+        elif queue_size is not None:
+            queue_part = f"Queue: {size_val}"
+        else:
+            queue_part = "Queue: --"
+        players_part = (
+            f"Bridge: {', '.join(players)}" if players else "Bridge: keine Verbindung"
+        )
+        self.status_bar_text = f"{players_part} | {queue_part}"
 
     def update_pause_overlay(self):
         pause_cover = self.wid_safe('pause_cover')
