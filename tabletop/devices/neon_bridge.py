@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import queue
 import socket
 import threading
 import time
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 import pupil_labs.realtime_api as plrt
@@ -26,12 +27,16 @@ class PupilBridge:
         self._hosts: dict[str, str] = {}
         self._devices: dict[str, plrt.Device] = {}
         self._connected: set[str] = set()
-        self._event_q: queue.Queue = queue.Queue(maxsize=2048)
+        self._event_q: "queue.PriorityQueue[tuple[int, int, object]]" = queue.PriorityQueue(
+            maxsize=2048
+        )
+        self._event_sequence = itertools.count()
         self._queue_sentinel = object()
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._recording_states: dict[str, bool] = {}
         self._recording_labels: dict[str, str] = {}
+        self._event_retry_base = 0.2
         self._logger.info("Neon PupilBridge initialisiert – bereit für Verbindungen.")
 
     # ------------------------------------------------------------------
@@ -85,7 +90,23 @@ class PupilBridge:
         if self._worker and self._worker.is_alive():
             self._logger.debug("Stoppe Neon-Event-Worker.")
             self._worker_stop.set()
-            self._event_q.put(self._queue_sentinel)
+            sentinel_token = (2, next(self._event_sequence), self._queue_sentinel)
+            inserted = False
+            while not inserted:
+                try:
+                    self._event_q.put(sentinel_token, timeout=0.5)
+                except queue.Full:
+                    self._logger.debug(
+                        "Event-Warteschlange voll beim Stoppen – verwerfe ältesten Eintrag."
+                    )
+                    try:
+                        self._event_q.get_nowait()
+                    except queue.Empty:
+                        continue
+                    else:
+                        self._event_q.task_done()
+                else:
+                    inserted = True
             self._worker.join(timeout=2.0)
         self._worker = None
         self._worker_stop.clear()
@@ -313,9 +334,17 @@ class PupilBridge:
             return
 
         event_payload: Dict[str, object] = dict(payload or {})
+        priority_level = 0 if priority == "high" else 1
+        event: Dict[str, object] = {
+            "player": player,
+            "name": name,
+            "payload": event_payload,
+        }
 
         try:
-            self._event_q.put_nowait((player, name, event_payload, priority))
+            self._event_q.put_nowait(
+                (priority_level, next(self._event_sequence), event)
+            )
         except queue.Full:
             self._logger.warning(
                 "Event-Warteschlange voll – Ereignis %s für Spieler %s verworfen.",
@@ -433,7 +462,7 @@ class PupilBridge:
     def _event_worker(self) -> None:
         while True:
             try:
-                item = self._event_q.get()
+                _priority, _seq, item = self._event_q.get()
             except Exception:  # pragma: no cover - defensive, queue shouldn't fail
                 if self._worker_stop.is_set():
                     break
@@ -443,7 +472,12 @@ class PupilBridge:
                 if item is self._queue_sentinel:
                     break
 
-                player, name, payload, priority = item
+                if not isinstance(item, dict):
+                    continue
+
+                player = str(item.get("player"))
+                name = str(item.get("name"))
+                payload = item.get("payload")
                 device = self._devices.get(player)
                 if device is None:
                     self._logger.warning(
@@ -453,20 +487,13 @@ class PupilBridge:
                     )
                     continue
 
-                emitter = getattr(getattr(device, "events", None), "emit_event", None)
-                if not callable(emitter):
+                payload_dict = payload if isinstance(payload, dict) else {}
+                if not self._send_marker_with_retry(device, name, payload_dict):
                     self._logger.warning(
-                        "Gerät %s unterstützt keine Event-Emission – Ereignis %s verworfen.",
-                        player,
+                        "Marker %s für Spieler %s konnte nach mehreren Versuchen nicht gesendet werden.",
                         name,
+                        player,
                     )
-                    continue
-
-                payload = payload or {}
-                if priority is not None:
-                    emitter(name=name, payload=payload, priority=priority)
-                else:
-                    emitter(name=name, payload=payload)
             except Exception as exc:  # pragma: no cover - depends on external API
                 self._logger.warning("Senden eines Events fehlgeschlagen: %s", exc)
             finally:
@@ -474,10 +501,122 @@ class PupilBridge:
 
         self._logger.debug("Neon-Event-Worker beendet.")
 
+    def _send_marker_with_retry(
+        self, device: plrt.Device, name: str, payload: Dict[str, object]
+    ) -> bool:
+        max_attempts = 3
+        delay = max(0.02, float(self._event_retry_base))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._emit_marker(device, name, payload)
+            except Exception as exc:  # pragma: no cover - depends on external API
+                if attempt >= max_attempts or not self._is_transient_error(exc):
+                    self._logger.debug(
+                        "Marker-Senden fehlgeschlagen (Versuch %d/%d): %s",
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    return False
+                sleep_for = delay * (2 ** (attempt - 1))
+                self._logger.debug(
+                    "Marker-Senden fehlgeschlagen (Versuch %d/%d) – neuer Versuch in %.3fs: %s",
+                    attempt,
+                    max_attempts,
+                    sleep_for,
+                    exc,
+                )
+                time.sleep(min(sleep_for, 2.0))
+                continue
+            else:
+                return True
+        return False
+
+    def _emit_marker(
+        self, device: plrt.Device, name: str, payload: Dict[str, object]
+    ) -> None:
+        annotations = getattr(device, "annotations", None)
+        payload = payload or {}
+        if annotations is not None:
+            if self._try_annotation_methods(annotations, name, payload):
+                return
+
+        emitter = getattr(getattr(device, "events", None), "emit_event", None)
+        if callable(emitter):
+            try:
+                emitter(name=name, payload=payload)
+            except TypeError:
+                emitter(name)
+            return
+
+        raise RuntimeError(
+            f"Gerät {getattr(device, 'name', '<unknown>')} unterstützt keine Marker-Schnittstelle"
+        )
+
+    def _try_annotation_methods(
+        self, annotations: Any, name: str, payload: Dict[str, object]
+    ) -> bool:
+        candidate_calls = (
+            ("create_marker", {"label": name, "properties": payload}),
+            ("record_marker", {"label": name, "properties": payload}),
+            ("create_annotation", {"label": name, "properties": payload}),
+            ("record_annotation", {"label": name, "properties": payload}),
+            ("create", {"label": name, "properties": payload}),
+            ("record", {"label": name, "properties": payload}),
+        )
+
+        for attr, kwargs in candidate_calls:
+            fn = getattr(annotations, attr, None)
+            if not callable(fn):
+                continue
+            try:
+                self._invoke_annotation_callable(fn, name, payload, kwargs)
+            except TypeError:
+                continue
+            else:
+                return True
+        return False
+
+    def _invoke_annotation_callable(
+        self,
+        fn: Any,
+        name: str,
+        payload: Dict[str, object],
+        kwargs: Dict[str, object],
+    ) -> None:
+        try:
+            if payload:
+                fn(**kwargs)
+            else:
+                minimal = dict(kwargs)
+                minimal.pop("properties", None)
+                fn(**minimal) if minimal else fn(name)
+        except TypeError:
+            if payload:
+                try:
+                    fn(name, payload)
+                except TypeError:
+                    fn(name)
+            else:
+                fn(name)
+
+    def _is_transient_error(self, exc: Exception) -> bool:
+        transient_types = (TimeoutError, ConnectionError, OSError)
+        if isinstance(exc, transient_types):
+            return True
+        if getattr(exc, "transient", False):
+            return True
+        status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+        if isinstance(status, int) and 500 <= status < 600:
+            return True
+        message = str(exc).lower()
+        keywords = ("timeout", "temporarily", "temporary", "connection", "unavailable")
+        return any(word in message for word in keywords)
+
     def _drain_queue(self) -> None:
         while True:
             try:
-                self._event_q.get_nowait()
+                _priority, _seq, _item = self._event_q.get_nowait()
             except queue.Empty:
                 break
             else:
