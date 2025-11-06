@@ -24,9 +24,13 @@ class PupilBridge:
     """
 
     _connected: Dict[str, bool] = field(default_factory=dict)
+    _hosts: Dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Connection handling
+    def configure_hosts(self, hosts: Dict[str, str]) -> None:
+        self._hosts = dict(hosts)
+
     def connect(self) -> None:
         """Pretend to establish a connection to eye-tracking devices."""
 

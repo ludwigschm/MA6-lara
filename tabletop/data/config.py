@@ -8,7 +8,27 @@ the same assumptions as the engine layer without duplicating constants.
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
+
+
+def load_tracker_hosts() -> dict[str, str]:
+    path = Path("tracker_hosts.txt")
+    if not path.is_absolute():
+        path = ROOT / path
+    hosts: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.match(r"(\w+)\s*=\s*([0-9\.]+(?::\d{2,5})?)$", line)
+            if match:
+                hosts[match.group(1)] = match.group(2)
+    hosts.setdefault("VP1", os.getenv("NEON_VP1_HOST", ""))
+    hosts.setdefault("VP2", os.getenv("NEON_VP2_HOST", ""))
+    return {key: value for key, value in hosts.items() if value}
 
 
 # --- Root paths -----------------------------------------------------------
@@ -35,5 +55,6 @@ __all__ = [
     "CARD_DIR",
     "CARD_COMBINATIONS_DIR",
     "ARUCO_OVERLAY_PATH",
+    "load_tracker_hosts",
 ]
 

@@ -30,7 +30,7 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
 
-from tabletop.data.config import ARUCO_OVERLAY_PATH
+from tabletop.data.config import ARUCO_OVERLAY_PATH, load_tracker_hosts
 from tabletop.logging.round_csv import close_round_log, flush_round_log
 from tabletop.overlay.process import (
     OverlayProcess,
@@ -830,6 +830,7 @@ def main(
     logging_listener, logging_queue = _configure_async_logging()
 
     bridge = PupilBridge()
+    bridge.configure_hosts(load_tracker_hosts())
     try:
         bridge.connect()
     except Exception:  # pragma: no cover - defensive fallback
