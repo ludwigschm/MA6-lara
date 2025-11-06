@@ -37,3 +37,7 @@ Der Demo-Lauf simuliert Button-Events sowie Heartbeats, zeigt den Übergang von
 „provisional“ → „refined“ mit `event_id`, aktueller `mapping_version`,
 Konfidenz und Queue-Last direkt in der Konsole und erzeugt eine Demo-Datenbank
 (`logs/demo_refinement.sqlite3`).
+
+Falls ein angeschlossenes Gerät keine nachträglichen Änderungen an bestehenden
+Annotationen zulässt (z. B. Neon ohne Retro-Edit), werden Refinements trotzdem
+hostseitig gespiegelt und im Laufordner (`runs/`) protokolliert.

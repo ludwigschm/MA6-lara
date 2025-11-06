@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import queue
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -37,6 +39,10 @@ class PupilBridge:
         self._recording_states: dict[str, bool] = {}
         self._recording_labels: dict[str, str] = {}
         self._event_retry_base = 0.2
+        self._mirror_lock = threading.RLock()
+        self._host_mirror: dict[str, dict[str, dict[str, Any]]] = {}
+        self._host_log_lock = threading.Lock()
+        self._host_log_path = Path.cwd() / "runs" / "neon_host_mirror.jsonl"
         self._logger.info("Neon PupilBridge initialisiert – bereit für Verbindungen.")
 
     # ------------------------------------------------------------------
@@ -352,6 +358,27 @@ class PupilBridge:
                 player,
             )
 
+    def send_host_mirror(
+        self,
+        player: str,
+        event_id: str,
+        t_ref_ns: int,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        entry = self._store_host_mirror(
+            player,
+            event_id,
+            t_ref_ns,
+            extra=extra,
+        )
+        self._logger.debug(
+            "Host mirror gespeichert: %s/%s -> %dns (samples=%d)",
+            player,
+            event_id,
+            int(t_ref_ns),
+            len(entry.get("host_samples", [])),
+        )
+
     def refine_event(
         self,
         player: str,
@@ -362,15 +389,70 @@ class PupilBridge:
         mapping_version: int,
         extra: Optional[Dict[str, object]] = None,
     ) -> None:
-        self._logger.warning(
-            "refine_event(player=%s, event_id=%s, t_ref_ns=%s, confidence=%s, mapping_version=%s, extra=%s) noch nicht implementiert.",
+        mirror_entry = self._store_host_refinement(
             player,
             event_id,
             t_ref_ns,
-            confidence,
-            mapping_version,
-            extra,
+            confidence=confidence,
+            mapping_version=mapping_version,
+            extra=extra,
         )
+
+        refinements = mirror_entry.get("refinements", [])
+        if not refinements:
+            return
+        payload = refinements[-1]
+
+        annotations = None
+        device = self._devices.get(player)
+        if device is not None:
+            annotations = getattr(device, "annotations", None)
+
+        if annotations is None:
+            self._logger.info(
+                "Gerät %s unterstützt keine Refinements – speichere hostseitig.",
+                player,
+            )
+            return
+
+        refine_fn = getattr(annotations, "refine", None)
+        if not callable(refine_fn):
+            self._logger.info(
+                "Annotations-Interface des Geräts %s bietet kein refine().", player
+            )
+            return
+
+        try:
+            refine_fn(
+                event_id=event_id,
+                timestamp_ns=payload["t_ref_ns"],
+                confidence=payload["confidence"],
+                mapping_version=payload["mapping_version"],
+                extra=payload["extra"],
+            )
+        except TypeError:
+            try:
+                refine_fn(
+                    event_id,
+                    payload["t_ref_ns"],
+                    payload["confidence"],
+                    payload["mapping_version"],
+                    payload["extra"],
+                )
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                self._logger.info(
+                    "Refinement für %s/%s konnte nicht an Gerät übermittelt werden: %s",
+                    player,
+                    event_id,
+                    exc,
+                )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self._logger.info(
+                "Refinement für %s/%s konnte nicht an Gerät übermittelt werden: %s",
+                player,
+                event_id,
+                exc,
+            )
 
     def event_queue_load(self) -> Tuple[int, int]:
         load = self._event_q.qsize()
@@ -612,6 +694,88 @@ class PupilBridge:
         message = str(exc).lower()
         keywords = ("timeout", "temporarily", "temporary", "connection", "unavailable")
         return any(word in message for word in keywords)
+
+    # ------------------------------------------------------------------
+    # Host mirror helpers
+    def _store_host_mirror(
+        self,
+        player: str,
+        event_id: str,
+        t_ref_ns: int,
+        *,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> dict[str, Any]:
+        sample = {
+            "t_ref_ns": int(t_ref_ns),
+            "extra": dict(extra or {}),
+            "recorded_at_ns": time.time_ns(),
+        }
+        with self._mirror_lock:
+            player_bucket = self._host_mirror.setdefault(player, {})
+            entry = player_bucket.setdefault(
+                event_id,
+                {"event_id": event_id, "host_samples": [], "refinements": []},
+            )
+            host_samples = entry.setdefault("host_samples", [])
+            host_samples.append(sample)
+            entry["last_host_sample"] = sample
+        self._append_host_log(
+            {
+                "kind": "host_mirror",
+                "player": player,
+                "event_id": event_id,
+                "payload": sample,
+            }
+        )
+        return entry
+
+    def _store_host_refinement(
+        self,
+        player: str,
+        event_id: str,
+        t_ref_ns: int,
+        *,
+        confidence: float,
+        mapping_version: int,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> dict[str, Any]:
+        refinement = {
+            "t_ref_ns": int(t_ref_ns),
+            "confidence": float(confidence),
+            "mapping_version": int(mapping_version),
+            "extra": dict(extra or {}),
+            "recorded_at_ns": time.time_ns(),
+        }
+        with self._mirror_lock:
+            player_bucket = self._host_mirror.setdefault(player, {})
+            entry = player_bucket.setdefault(
+                event_id,
+                {"event_id": event_id, "host_samples": [], "refinements": []},
+            )
+            refinements = entry.setdefault("refinements", [])
+            refinements.append(refinement)
+            entry["last_refinement"] = refinement
+        self._append_host_log(
+            {
+                "kind": "refine_event",
+                "player": player,
+                "event_id": event_id,
+                "payload": refinement,
+            }
+        )
+        return entry
+
+    def _append_host_log(self, entry: dict[str, Any]) -> None:
+        try:
+            with self._host_log_lock:
+                self._host_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._host_log_path.open("a", encoding="utf-8") as handle:
+                    json.dump(entry, handle, ensure_ascii=False, sort_keys=True)
+                    handle.write("\n")
+        except Exception:
+            self._logger.debug(
+                "Host-Mirror-Log konnte nicht geschrieben werden.", exc_info=True
+            )
 
     def _drain_queue(self) -> None:
         while True:
