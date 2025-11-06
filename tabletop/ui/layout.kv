@@ -2,6 +2,87 @@
 #:import CardWidget tabletop.ui.widgets.CardWidget
 #:import RotatableLabel tabletop.ui.widgets.RotatableLabel
 #:import ASSETS tabletop.ui.assets.ASSETS
+#:import RoundedRectangle kivy.graphics.vertex_instructions.RoundedRectangle
+
+<TrackerHostDialog@ModalView>:
+    size_hint: None, None
+    size: 720, 420
+    auto_dismiss: False
+    background: ""
+    background_color: 0, 0, 0, 0
+    vp1: ""
+    vp2: ""
+    error_message: ""
+
+    BoxLayout:
+        orientation: "vertical"
+        padding: 40
+        spacing: 24
+
+        canvas.before:
+            Color:
+                rgba: 0.08, 0.08, 0.08, 0.92
+            RoundedRectangle:
+                pos: self.pos
+                size: self.size
+                radius: [18]
+
+        Label:
+            text: "Tracker-Einstellungen"
+            font_size: "28sp"
+            size_hint_y: None
+            height: self.texture_size[1]
+            bold: True
+
+        GridLayout:
+            cols: 2
+            spacing: 16
+            row_force_default: True
+            row_default_height: 70
+            size_hint_y: None
+            height: self.minimum_height
+
+            Label:
+                text: "VP1"
+                halign: "right"
+                valign: "middle"
+                text_size: self.size
+
+            TextInput:
+                id: vp1_input
+                text: root.vp1
+                hint_text: "z.B. 192.168.0.10:8080"
+                multiline: False
+                write_tab: False
+
+            Label:
+                text: "VP2"
+                halign: "right"
+                valign: "middle"
+                text_size: self.size
+
+            TextInput:
+                id: vp2_input
+                text: root.vp2
+                hint_text: "z.B. 192.168.0.11:8080"
+                multiline: False
+                write_tab: False
+
+        Label:
+            id: error_label
+            text: root.error_message
+            color: (1, 0.35, 0.35, 1)
+            size_hint_y: None
+            height: self.texture_size[1] + (10 if self.text else 0)
+            text_size: self.width, None
+            halign: "center"
+
+        Button:
+            text: "Speichern"
+            size_hint_y: None
+            height: 80
+            font_size: "22sp"
+            on_release: root.confirm()
 
 <TabletopRoot>:
     horizontal_offset: 0.08  # fraction of total width (≈8%)
@@ -24,6 +105,7 @@
     fixation_overlay: fixation_overlay
     fixation_image: fixation_image
     round_badge: round_badge
+    settings_button: settings_button
 
     IconButton:
         id: btn_start_p1
@@ -145,6 +227,18 @@
         size_hint: None, None
         size: 260 * root.button_scale * root.scale, 260 * root.button_scale * root.scale
         pos: root.ids.decision_p2_bluff.x, root.ids.decision_p2_bluff.y - root.ids.decision_p2_bluff.height - 40 * root.button_scale * root.scale
+
+    Button:
+        id: settings_button
+        text: "⚙ Einstellungen"
+        size_hint: None, None
+        size: 360 * root.button_scale * root.scale, 120 * root.button_scale * root.scale
+        pos: root.width - root.horizontal_margin_px - self.width - 120 * root.scale, root.height - self.height - 140 * root.scale
+        font_size: 48 * root.scale
+        background_normal: ""
+        background_down: ""
+        background_color: (0.12, 0.12, 0.12, 0.85)
+        color: (1, 1, 1, 1)
 
     Image:
         id: center_p1_card_right

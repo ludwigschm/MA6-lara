@@ -5,6 +5,7 @@ import itertools
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from contextlib import suppress
@@ -15,18 +16,19 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional,
 import numpy as np
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.properties import DictProperty, NumericProperty, ObjectProperty
+from kivy.properties import DictProperty, NumericProperty, ObjectProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
+from kivy.uix.modalview import ModalView
 from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
 from kivy.uix.switch import Switch
 from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
-from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT
+from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT, load_tracker_hosts
 from tabletop.logging import async_bridge
 from tabletop.logging.events import Events
 from tabletop.logging.round_csv import (
@@ -73,6 +75,32 @@ ui_widgets.ASSETS = ASSETS
 STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
 
 
+class TrackerHostDialog(ModalView):
+    vp1 = StringProperty("")
+    vp2 = StringProperty("")
+    error_message = StringProperty("")
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.register_event_type("on_save")
+
+    def confirm(self) -> None:
+        vp1_value = ""
+        vp2_value = ""
+        with suppress(Exception):
+            widget = self.ids.get("vp1_input")
+            if widget is not None:
+                vp1_value = widget.text.strip()
+        with suppress(Exception):
+            widget = self.ids.get("vp2_input")
+            if widget is not None:
+                vp2_value = widget.text.strip()
+        self.dispatch("on_save", vp1_value, vp2_value)
+
+    def on_save(self, _vp1: str, _vp2: str) -> None:  # pragma: no cover - event hook
+        return None
+
+
 class _AsyncMarkerBridge:
     def __init__(self, owner: "TabletopRoot") -> None:
         self._owner = owner
@@ -117,6 +145,7 @@ class TabletopRoot(FloatLayout):
     fixation_overlay = ObjectProperty(None)
     fixation_image = ObjectProperty(None)
     round_badge = ObjectProperty(None)
+    settings_button = ObjectProperty(None)
 
     signal_buttons = DictProperty({})
     decision_buttons = DictProperty({})
@@ -238,6 +267,11 @@ class TabletopRoot(FloatLayout):
         self._heartbeat_label = "sync.heartbeat"
         self._heartbeat_counter = 0
         self._origin_device_id = "host_ui"
+        self._tracker_settings_dialog: Optional[TrackerHostDialog] = None
+        self._tracker_hosts_path = Path(ROOT) / "tracker_hosts.txt"
+        self._tracker_host_pattern = re.compile(
+            r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?::(?P<port>\d{1,5}))?$"
+        )
         self.update_bridge_context(
             bridge=bridge,
             player=bridge_player,
@@ -745,6 +779,151 @@ class TabletopRoot(FloatLayout):
             aruco_enabled=self.aruco_enabled,
         )
 
+    # --- Tracker host configuration ---------------------------------
+    def _read_tracker_host_file(self) -> dict[str, str]:
+        hosts: dict[str, str] = {}
+        path = self._tracker_hosts_path
+        try:
+            if path.exists():
+                for raw_line in path.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key_part, value_part = line.split("=", 1)
+                    key = key_part.strip()
+                    candidate = value_part.strip()
+                    match = self._tracker_host_pattern.match(candidate)
+                    if match and key:
+                        ip = match.group("ip")
+                        port = match.group("port") or "8080"
+                        hosts[key] = f"{ip}:{int(port)}"
+        except Exception:
+            log.exception("Lesen der tracker_hosts.txt fehlgeschlagen")
+            hosts = {}
+        if not hosts:
+            try:
+                hosts = load_tracker_hosts()
+            except Exception:
+                log.exception("Laden der Tracker-Hosts fehlgeschlagen")
+                hosts = {}
+        cleaned: dict[str, str] = {}
+        for key in ("VP1", "VP2"):
+            value = hosts.get(key, "")
+            if not value:
+                continue
+            try:
+                normalized = self._normalize_tracker_host(key, value)
+            except ValueError:
+                normalized = value.strip()
+            if normalized:
+                cleaned[key] = normalized
+        return cleaned
+
+    def _normalize_tracker_host(self, label: str, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            return ""
+        match = self._tracker_host_pattern.match(value)
+        if not match:
+            raise ValueError(f"Ungültige Adresse für {label}. Erwartet Format IP[:Port].")
+        ip = match.group("ip")
+        try:
+            octets = [int(part) for part in ip.split(".")]
+        except ValueError as exc:
+            raise ValueError(f"Ungültige Adresse für {label}.") from exc
+        if len(octets) != 4 or any(part < 0 or part > 255 for part in octets):
+            raise ValueError(f"Ungültige Adresse für {label}. Oktette müssen 0-255 sein.")
+        port_text = match.group("port") or "8080"
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise ValueError(f"Ungültiger Port für {label}.") from exc
+        if port <= 0 or port >= 65536:
+            raise ValueError(f"Ungültiger Port für {label}. Erlaubt sind 1-65535.")
+        return f"{ip}:{port}"
+
+    def _prepare_tracker_hosts(self, vp1_value: str, vp2_value: str) -> dict[str, str]:
+        prepared: dict[str, str] = {}
+        for label, value in (("VP1", vp1_value), ("VP2", vp2_value)):
+            normalized = self._normalize_tracker_host(label, value)
+            if normalized:
+                prepared[label] = normalized
+        return prepared
+
+    def _write_tracker_hosts(self, hosts: dict[str, str]) -> None:
+        lines = [f"{key} = {value}" for key, value in sorted(hosts.items())]
+        text = "\n".join(lines)
+        try:
+            if lines:
+                self._tracker_hosts_path.write_text(text + "\n", encoding="utf-8")
+            else:
+                self._tracker_hosts_path.write_text("", encoding="utf-8")
+        except Exception as exc:
+            raise OSError(f"tracker_hosts.txt konnte nicht geschrieben werden: {exc}") from exc
+
+    def _apply_tracker_hosts(self, hosts: dict[str, str]) -> None:
+        bridge = self._bridge
+        if bridge is not None:
+            try:
+                bridge.configure_hosts(hosts)
+            except Exception:
+                log.exception("Konfiguration der Tracker-Hosts fehlgeschlagen")
+            try:
+                bridge.close()
+            except Exception:
+                log.exception("Schließen der Bridge vor dem Reconnect fehlgeschlagen")
+            try:
+                bridge.connect()
+            except Exception:
+                log.exception("Erneute Verbindung zur Bridge fehlgeschlagen")
+        self._mark_bridge_dirty()
+        self._ensure_bridge_recordings(force=True)
+
+    def open_tracker_settings_dialog(self) -> None:
+        existing = self._read_tracker_host_file()
+        if self._tracker_settings_dialog is not None:
+            with suppress(Exception):
+                self._tracker_settings_dialog.dismiss()
+        dialog = TrackerHostDialog(
+            vp1=existing.get("VP1", ""),
+            vp2=existing.get("VP2", ""),
+            size_hint=(None, None),
+        )
+        width = max(420.0, min(self.width * 0.55, 820.0))
+        height = max(320.0, min(self.height * 0.5, 520.0))
+        dialog.size = (width, height)
+        dialog.bind(on_save=self._handle_tracker_settings_save)
+        dialog.bind(on_dismiss=lambda *_: self._clear_tracker_settings_dialog(dialog))
+        dialog.open()
+        self._tracker_settings_dialog = dialog
+
+    def _clear_tracker_settings_dialog(self, dialog: TrackerHostDialog) -> None:
+        if self._tracker_settings_dialog is dialog:
+            self._tracker_settings_dialog = None
+
+    def _handle_tracker_settings_save(
+        self, dialog: TrackerHostDialog, vp1_value: str, vp2_value: str
+    ) -> None:
+        try:
+            hosts = self._prepare_tracker_hosts(vp1_value, vp2_value)
+        except ValueError as exc:
+            dialog.error_message = str(exc)
+            return
+        try:
+            self._write_tracker_hosts(hosts)
+        except OSError as exc:
+            log.exception("Speichern der Tracker-Hosts fehlgeschlagen")
+            dialog.error_message = str(exc)
+            return
+
+        dialog.error_message = ""
+        dialog.vp1 = hosts.get("VP1", vp1_value.strip())
+        dialog.vp2 = hosts.get("VP2", vp2_value.strip())
+        dialog.dismiss()
+        self._apply_tracker_hosts(hosts)
+
     # --- Layout & Elemente
     def _configure_widgets(self):
         btn_start_p1 = self.wid_safe('btn_start_p1')
@@ -770,6 +949,10 @@ class TabletopRoot(FloatLayout):
             pause_btn_p2.set_live(False)
             pause_btn_p2.disabled = True
             pause_btn_p2.opacity = 0
+
+        settings_btn = self.wid_safe('settings_button')
+        if settings_btn is not None:
+            settings_btn.bind(on_release=lambda *_: self.open_tracker_settings_dialog())
 
         p1_outer = self.wid_safe('p1_outer')
         if p1_outer is not None:
