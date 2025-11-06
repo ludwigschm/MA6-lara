@@ -102,6 +102,17 @@ def run_fixation_sequence(
         player_targets.add(player)
     player_list = tuple(sorted(player_targets))
 
+    def _emit_fixation_event(name: str, payload: Optional[dict[str, Any]] = None) -> None:
+        if bridge is None or not player_list:
+            return
+        for target in player_list:
+            if not bridge.is_connected(target):
+                continue
+            if payload:
+                bridge.send_event(name, target, dict(payload))
+            else:
+                bridge.send_event(name, target)
+
     def _send_sync_event(name: str) -> None:
         if bridge is None or not player_list:
             return
@@ -144,6 +155,8 @@ def run_fixation_sequence(
     image.opacity = 1
     _set_image_source(image, live_image, fallback="cross")
 
+    _emit_fixation_event("fix.start", {"phase": "start"})
+
     def finish(_dt: float) -> None:
         if getattr(overlay, "parent", None) is not None:
             controller.remove_widget(overlay)
@@ -160,12 +173,19 @@ def run_fixation_sequence(
 
     def show_final_live(_dt: float) -> None:
         _set_image_source(image, live_image, fallback="cross")
+        _emit_fixation_event("fix.flash_end")
         schedule_once(finish, 5)
 
     def show_stop_and_tone(_dt: float) -> None:
         _set_image_source(image, stop_image, fallback="blank")
         _log_fixation_event("fixation_flash")
-        setattr(controller, "fixation_beep_callback", lambda: _log_fixation_event("fixation_beep"))
+        _emit_fixation_event("fix.flash_start")
+
+        def _on_beep() -> None:
+            _log_fixation_event("fixation_beep")
+            _emit_fixation_event("fix.beep")
+
+        setattr(controller, "fixation_beep_callback", _on_beep)
         play_fixation_tone(controller)
         if hasattr(controller, "fixation_beep_callback"):
             controller.fixation_beep_callback = None
