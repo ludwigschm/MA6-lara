@@ -25,6 +25,7 @@ class PupilBridge:
 
     _connected: Dict[str, bool] = field(default_factory=dict)
     _hosts: Dict[str, str] = field(default_factory=dict)
+    _mirror: Dict[str, Dict[str, Dict[str, object]]] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Connection handling
@@ -78,6 +79,26 @@ class PupilBridge:
     ) -> None:
         return None
 
+    def send_host_mirror(
+        self,
+        player: str,
+        event_id: str,
+        t_ref_ns: int,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        player_store = self._mirror.setdefault(player, {})
+        entry = player_store.setdefault(
+            event_id,
+            {"event_id": event_id, "host_samples": [], "refinements": []},
+        )
+        sample = {
+            "t_ref_ns": int(t_ref_ns),
+            "extra": dict(extra or {}),
+        }
+        entry.setdefault("host_samples", []).append(sample)
+        entry["last_host_sample"] = sample
+        return None
+
     def refine_event(
         self,
         player: str,
@@ -88,6 +109,19 @@ class PupilBridge:
         mapping_version: int,
         extra: Optional[Dict[str, object]] = None,
     ) -> None:
+        player_store = self._mirror.setdefault(player, {})
+        entry = player_store.setdefault(
+            event_id,
+            {"event_id": event_id, "host_samples": [], "refinements": []},
+        )
+        refinement = {
+            "t_ref_ns": int(t_ref_ns),
+            "confidence": float(confidence),
+            "mapping_version": int(mapping_version),
+            "extra": dict(extra or {}),
+        }
+        entry.setdefault("refinements", []).append(refinement)
+        entry["last_refinement"] = refinement
         return None
 
     def event_queue_load(self) -> Tuple[int, int]:
