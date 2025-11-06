@@ -33,6 +33,12 @@ Einen schnellen Smoke-Test liefert:
 python -m tabletop.app --demo
 ```
 
+Für einen Bridge-Check ohne UI kann folgender Befehl genutzt werden:
+
+```bash
+python -m scripts.neon_smoke
+```
+
 Der Demo-Lauf simuliert Button-Events sowie Heartbeats, zeigt den Übergang von
 „provisional“ → „refined“ mit `event_id`, aktueller `mapping_version`,
 Konfidenz und Queue-Last direkt in der Konsole und erzeugt eine Demo-Datenbank
