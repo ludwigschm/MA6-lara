@@ -6,6 +6,7 @@ import logging
 import queue
 import socket
 import threading
+import time
 from typing import Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -29,6 +30,8 @@ class PupilBridge:
         self._queue_sentinel = object()
         self._worker_stop = threading.Event()
         self._worker: threading.Thread | None = None
+        self._recording_states: dict[str, bool] = {}
+        self._recording_labels: dict[str, str] = {}
         self._logger.info("Neon PupilBridge initialisiert – bereit für Verbindungen.")
 
     # ------------------------------------------------------------------
@@ -127,23 +130,169 @@ class PupilBridge:
         block: Optional[int],
         players: Optional[Iterable[str]] = None,
     ) -> None:
-        self._logger.warning(
-            "ensure_recordings(session=%s, block=%s, players=%s) noch nicht implementiert.",
-            session,
-            block,
-            tuple(players) if players is not None else None,
-        )
+        if session is None or block is None:
+            self._logger.debug(
+                "ensure_recordings() übersprungen – Session oder Block fehlt (session=%s, block=%s).",
+                session,
+                block,
+            )
+            return
+
+        if players is None:
+            active_players: Tuple[str, ...] = tuple(self.connected_players())
+        else:
+            active_players = tuple(str(player) for player in players if player)
+
+        if not active_players:
+            self._logger.debug("ensure_recordings() – keine aktiven Spieler gefunden.")
+            return
+
+        for player in active_players:
+            if not self._is_recording(player):
+                self.start_recording(session, block, player)
 
     def start_recording(self, session: int, block: int, player: str) -> None:
-        self._logger.warning(
-            "start_recording(session=%s, block=%s, player=%s) noch nicht implementiert.",
-            session,
-            block,
+        device = self._devices.get(player)
+        if device is None:
+            self._logger.warning(
+                "Start der Aufnahme für Spieler %s übersprungen – kein verbundenes Gerät.",
+                player,
+            )
+            return
+
+        label = f"s{session:02d}_b{block:02d}_{player}"
+        recordings = getattr(device, "recordings", None)
+        if recordings is None:
+            self._logger.warning(
+                "Gerät %s unterstützt keine Aufnahmen – start_recording übersprungen.",
+                player,
+            )
+            return
+
+        if self._is_recording(player, device=device):
+            self._logger.debug(
+                "Spieler %s nimmt bereits auf – starte nicht erneut (Label %s).",
+                player,
+                label,
+            )
+            self._recording_labels[player] = label
+            return
+
+        start_callable = getattr(recordings, "start", None)
+        if not callable(start_callable):
+            self._logger.warning(
+                "Neon-API bietet keine start()-Methode für Spieler %s – Aufnahme kann nicht gestartet werden.",
+                player,
+            )
+            return
+
+        max_attempts = 3
+        backoff_base = 0.2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                try:
+                    start_callable(label=label)
+                except TypeError:
+                    start_callable(label)
+                self._logger.info(
+                    "Starte Neon-Aufnahme für Spieler %s (Label %s, Versuch %d/%d).",
+                    player,
+                    label,
+                    attempt,
+                    max_attempts,
+                )
+            except Exception as exc:  # pragma: no cover - depends on external API
+                self._logger.error(
+                    "Start der Neon-Aufnahme für Spieler %s fehlgeschlagen: %s", player, exc
+                )
+            else:
+                if self._wait_for_recording_state(player, True, device=device):
+                    self._recording_states[player] = True
+                    self._recording_labels[player] = label
+                    return
+                self._logger.warning(
+                    "Neon-Aufnahme für Spieler %s wurde nicht bestätigt – erneuter Versuch.",
+                    player,
+                )
+
+            if attempt < max_attempts:
+                backoff = backoff_base * (2 ** (attempt - 1))
+                time.sleep(backoff)
+
+        self._logger.error(
+            "Neon-Aufnahme für Spieler %s konnte nach %d Versuchen nicht gestartet werden.",
             player,
+            max_attempts,
         )
 
     def stop_recording(self, player: str) -> None:
-        self._logger.warning("stop_recording(player=%s) noch nicht implementiert.", player)
+        device = self._devices.get(player)
+        if device is None:
+            self._logger.warning(
+                "Stoppen der Aufnahme für Spieler %s übersprungen – kein verbundenes Gerät.",
+                player,
+            )
+            self._recording_states.pop(player, None)
+            self._recording_labels.pop(player, None)
+            return
+
+        recordings = getattr(device, "recordings", None)
+        if recordings is None:
+            self._logger.warning(
+                "Gerät %s unterstützt keine Aufnahmen – stop_recording übersprungen.",
+                player,
+            )
+            self._recording_states.pop(player, None)
+            self._recording_labels.pop(player, None)
+            return
+
+        if not self._is_recording(player, device=device):
+            self._logger.debug(
+                "Spieler %s führt keine aktive Aufnahme – Stop wird übersprungen.",
+                player,
+            )
+            self._recording_states.pop(player, None)
+            return
+
+        stop_callable = (
+            getattr(recordings, "stop_and_save", None)
+            or getattr(recordings, "stop", None)
+        )
+        if not callable(stop_callable):
+            self._logger.warning(
+                "Neon-API bietet keine Stop-Methode für Spieler %s – Aufnahme kann nicht beendet werden.",
+                player,
+            )
+            return
+
+        try:
+            label = self._recording_labels.get(player)
+            if label is not None:
+                try:
+                    stop_callable(label=label)
+                except TypeError:
+                    stop_callable(label)
+                except Exception:
+                    stop_callable()
+            else:
+                stop_callable()
+            self._logger.info("Stoppe Neon-Aufnahme für Spieler %s.", player)
+        except Exception as exc:  # pragma: no cover - depends on external API
+            self._logger.error(
+                "Stoppen der Neon-Aufnahme für Spieler %s fehlgeschlagen: %s", player, exc
+            )
+            return
+
+        if self._wait_for_recording_state(player, False, device=device, timeout=8.0):
+            self._logger.info("Neon-Aufnahme für Spieler %s beendet und gespeichert.", player)
+        else:
+            self._logger.error(
+                "Beenden der Neon-Aufnahme für Spieler %s wurde nicht bestätigt (Timeout).",
+                player,
+            )
+
+        self._recording_states.pop(player, None)
+        self._recording_labels.pop(player, None)
 
     # ------------------------------------------------------------------
     # Event helpers
@@ -206,6 +355,68 @@ class PupilBridge:
 
     # ------------------------------------------------------------------
     # Internal helpers
+    def _is_recording(self, player: str, *, device: plrt.Device | None = None) -> bool:
+        if device is None:
+            device = self._devices.get(player)
+        if device is None:
+            return False
+
+        recordings = getattr(device, "recordings", None)
+        if recordings is None:
+            return False
+
+        state = self._query_recording_state(recordings)
+        if state is None:
+            return bool(self._recording_states.get(player, False))
+
+        self._recording_states[player] = state
+        return state
+
+    def _wait_for_recording_state(
+        self,
+        player: str,
+        expected: bool,
+        *,
+        device: plrt.Device | None = None,
+        timeout: float = 4.0,
+        poll_interval: float = 0.2,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if self._is_recording(player, device=device) == expected:
+                return True
+            time.sleep(poll_interval)
+        return self._is_recording(player, device=device) == expected
+
+    def _query_recording_state(self, recordings: object) -> Optional[bool]:
+        candidates = (
+            "is_recording",
+            "isRecording",
+            "recording",
+            "recording_active",
+            "status",
+            "state",
+        )
+        for name in candidates:
+            value = getattr(recordings, name, None)
+            if value is None:
+                continue
+            try:
+                result = value() if callable(value) else value
+            except Exception:  # pragma: no cover - defensive
+                continue
+
+            if isinstance(result, bool):
+                return result
+            if isinstance(result, str):
+                lowered = result.strip().lower()
+                if lowered in {"recording", "saving", "stopping", "active"}:
+                    return True
+                if lowered in {"idle", "ready", "stopped", "saved", "inactive", "none"}:
+                    return False
+
+        return None
+
     def _start_worker(self) -> None:
         if self._worker and self._worker.is_alive():
             return
