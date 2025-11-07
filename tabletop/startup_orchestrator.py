@@ -49,8 +49,12 @@ class StartupOrchestrator:
         self._start_sequence_index = 0
         self._start_sequence_current_player: Optional[str] = None
         self._start_sequence_started_at = 0.0
+        self._start_attempt_started_at = 0.0
         self._error_message = ""
         self._current_start_attempt = 0
+        self._connect_attempt = 0
+        self._connect_started_at = 0.0
+        self._startup_began_at = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,8 +108,11 @@ class StartupOrchestrator:
         self._cancel_start_retry()
         self._error_message = ""
         self._current_start_attempt = 0
+        self._connect_attempt += 1
         self._transition(StartupState.CONNECTING)
         self._connect_deadline = time.monotonic() + self.CONNECT_TIMEOUT_S
+        self._connect_started_at = time.monotonic()
+        self._startup_began_at = self._connect_started_at
         hosts = getattr(self._bridge, "_hosts", {})
         try:
             detected_players = tuple(self._bridge.connected_players())
@@ -151,6 +158,7 @@ class StartupOrchestrator:
         self._start_sequence_index = 0
         self._start_sequence_current_player = None
         self._start_sequence_started_at = 0.0
+        self._start_attempt_started_at = 0.0
         self._cancel_start_poll()
         self._cancel_start_retry()
         self._schedule_start_sequence(delay=0.3)
@@ -195,8 +203,11 @@ class StartupOrchestrator:
             self._cancel_start_sequence_event()
             self._start_sequence_current_player = None
             self._start_sequence_started_at = 0.0
+            self._start_attempt_started_at = 0.0
         if new_state != StartupState.ERROR:
             self._error_message = ""
+        else:
+            self._log_error_state()
         self._notify_state_changed()
         self._notify_status_update()
 
@@ -259,6 +270,18 @@ class StartupOrchestrator:
                         "StartupOrchestrator: is_connected(%s) fehlgeschlagen", player, exc_info=True
                     )
         if expected and expected.issubset(connected) and expected.issubset(connected_players_raw) and expected.issubset(connected_flags):
+            elapsed_ms = int(max(0.0, (time.monotonic() - self._connect_started_at) * 1000.0))
+            self._log_attempt_result(
+                phase=StartupState.CONNECTING,
+                player="*",
+                attempt=self._connect_attempt,
+                elapsed_ms=elapsed_ms,
+                result="success",
+                details={
+                    "expected": ",".join(sorted(expected)) or "-",
+                    "connected": ",".join(sorted(connected)) or "-",
+                },
+            )
             log.info(
                 "StartupOrchestrator: Alle Tracker verbunden (%s)",
                 ", ".join(sorted(connected)),
@@ -266,6 +289,19 @@ class StartupOrchestrator:
             self.begin_start_recordings()
             return
         if now >= self._connect_deadline:
+            elapsed_ms = int(max(0.0, (time.monotonic() - self._connect_started_at) * 1000.0))
+            self._log_attempt_result(
+                phase=StartupState.CONNECTING,
+                player="*",
+                attempt=self._connect_attempt,
+                elapsed_ms=elapsed_ms,
+                result="timeout",
+                details={
+                    "expected": ",".join(sorted(expected)) or "-",
+                    "connected": ",".join(sorted(connected)) or "-",
+                },
+                level=logging.ERROR,
+            )
             log.error("StartupOrchestrator: Verbindungsaufbau abgelaufen")
             self._error_message = "Tracker nicht erreichbar"
             self._transition(StartupState.ERROR)
@@ -323,8 +359,25 @@ class StartupOrchestrator:
         if self._state != StartupState.STARTING:
             return
         player = self._start_sequence_current_player
+        attempt = self._current_start_attempt or 0
+        elapsed_ms = int(
+            max(0.0, (time.monotonic() - self._start_attempt_started_at) * 1000.0)
+        )
+        if player and attempt:
+            self._log_attempt_result(
+                phase=StartupState.STARTING,
+                player=player,
+                attempt=attempt,
+                elapsed_ms=elapsed_ms,
+                result="timeout",
+                level=logging.WARNING,
+            )
         if self._start_retries_left <= 0:
-            self._handle_sequence_failure(player)
+            self._handle_sequence_failure(
+                player,
+                message=f"Timeout nach {self.START_TIMEOUT_S:.1f}s",
+                log_attempt=False,
+            )
             return
         if player:
             log.warning(
@@ -336,6 +389,7 @@ class StartupOrchestrator:
         self._start_retry_event = Clock.schedule_once(
             self._execute_start_retry, self.RETRY_DELAY_S
         )
+        self._start_attempt_started_at = 0.0
         self._notify_status_update()
 
     def _execute_start_retry(self, _dt: float) -> None:
@@ -387,6 +441,7 @@ class StartupOrchestrator:
             self._start_sequence_started_at = 0.0
             self._start_retries_left = self.START_RETRIES
             self._current_start_attempt = 0
+            self._start_attempt_started_at = 0.0
             self._cancel_start_poll()
             self._cancel_start_retry()
             self._start_next_attempt()
@@ -414,6 +469,7 @@ class StartupOrchestrator:
         if attempt_number == 1:
             self._start_sequence_started_at = time.monotonic()
         self._start_retries_left -= 1
+        self._start_attempt_started_at = time.monotonic()
 
         session_value, block_value = self._resolve_session_block()
         if session_value is None or block_value is None:
@@ -454,7 +510,17 @@ class StartupOrchestrator:
 
     def _on_player_started(self, player: str) -> None:
         started_at = self._start_sequence_started_at or time.monotonic()
-        elapsed_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+        attempt_started_at = self._start_attempt_started_at or started_at
+        elapsed_ms = max(0.0, (time.monotonic() - attempt_started_at) * 1000.0)
+        attempt = self._current_start_attempt or 0
+        if attempt:
+            self._log_attempt_result(
+                phase=StartupState.STARTING,
+                player=player,
+                attempt=attempt,
+                elapsed_ms=int(elapsed_ms),
+                result="success",
+            )
         log.info(
             "StartupOrchestrator: Player %s läuft (t=%dms)",
             player,
@@ -464,6 +530,7 @@ class StartupOrchestrator:
         self._start_sequence_index += 1
         self._start_sequence_current_player = None
         self._current_start_attempt = 0
+        self._start_attempt_started_at = 0.0
         self._start_retries_left = self.START_RETRIES
         self._cancel_start_poll()
         self._cancel_start_retry()
@@ -480,6 +547,20 @@ class StartupOrchestrator:
         if players and not all(self._player_is_recording(player) for player in players):
             self._handle_sequence_failure(None)
             return
+        session_value, block_value = self._resolve_session_block()
+        if self._startup_began_at:
+            total_elapsed_ms = int(
+                max(0.0, (time.monotonic() - self._startup_began_at) * 1000.0)
+            )
+        else:
+            total_elapsed_ms = 0
+        log.info(
+            "Startup READY session_id=%s block_id=%s players=%s total_elapsed_ms=%d",
+            self._session_id or session_value,
+            self._block_id or block_value,
+            ",".join(players) or "-",
+            total_elapsed_ms,
+        )
         log.info("StartupOrchestrator: Alle Aufnahmen laufen.")
         self._transition(StartupState.READY)
         self._cancel_start_poll()
@@ -490,7 +571,23 @@ class StartupOrchestrator:
         player: Optional[str],
         *,
         message: str | None = None,
+        log_attempt: bool = True,
     ) -> None:
+        attempt = self._current_start_attempt or 0
+        elapsed_ms = int(
+            max(0.0, (time.monotonic() - self._start_attempt_started_at) * 1000.0)
+        )
+        player_label = player or "*"
+        if attempt and log_attempt:
+            self._log_attempt_result(
+                phase=StartupState.STARTING,
+                player=player_label,
+                attempt=attempt,
+                elapsed_ms=elapsed_ms,
+                result="error",
+                details={"reason": message or "-"},
+                level=logging.ERROR,
+            )
         if player:
             log.error(
                 "StartupOrchestrator: Aufnahme %s konnte nicht gestartet werden.",
@@ -502,6 +599,7 @@ class StartupOrchestrator:
             log.error("StartupOrchestrator: Aufnahmen konnten nicht gestartet werden")
             reason = f": {message}" if message else ""
             self._error_message = f"Aufnahmen konnten nicht gestartet werden{reason}."
+        self._start_attempt_started_at = 0.0
         self._cancel_start_poll()
         self._cancel_start_retry()
         self._cancel_start_sequence_event()
@@ -611,4 +709,43 @@ class StartupOrchestrator:
             log.debug("StartupOrchestrator: connected_players fehlgeschlagen", exc_info=True)
             return set()
         return {str(player) for player in players if player}
+
+    def _log_attempt_result(
+        self,
+        *,
+        phase: StartupState,
+        player: str,
+        attempt: int,
+        elapsed_ms: int,
+        result: str,
+        details: Optional[dict[str, object]] = None,
+        level: int = logging.INFO,
+    ) -> None:
+        parts = [
+            f"phase={phase.name}",
+            f"player={player}",
+            f"attempt={attempt}",
+            f"elapsed_ms={elapsed_ms}",
+            f"result={result}",
+        ]
+        for key, value in (details or {}).items():
+            parts.append(f"{key}={value}")
+        log.log(level, "StartupAttempt %s", " ".join(parts))
+
+    def _log_error_state(self) -> None:
+        user_message = self._error_message or "Unbekannter Fehler"
+        expected = sorted(self._expected_players())
+        connected = sorted(self._connected_players())
+        recording = [player for player in expected if self._player_is_recording(player)]
+        log.error("Startup fehlgeschlagen: %s", user_message)
+        log.error(
+            "Startup error user_message=\"%s\" connect_timeout_s=%.1f start_timeout_s=%.1f expected=%s connected=%s recording=%s state=%s",
+            user_message,
+            self.CONNECT_TIMEOUT_S,
+            self.START_TIMEOUT_S,
+            ",".join(expected) or "-",
+            ",".join(connected) or "-",
+            ",".join(sorted(recording)) or "-",
+            self._state.name,
+        )
 
