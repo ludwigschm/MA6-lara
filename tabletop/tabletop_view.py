@@ -288,9 +288,16 @@ class TabletopRoot(FloatLayout):
             block=bridge_block,
         )
 
+        # --- Zustände, die in apply_phase() gelesen werden, vor dem ersten Aufruf initialisieren
+        self.fixation_running = False
+        self.fixation_required = False
+        self.pending_fixation_callback = None
+        self.intro_active = True
+
         # --- UI Elemente initialisieren
         self._configure_widgets()
         self.setup_round()
+        # Defensive: apply_phase sollte nie auf nicht gesetzte Attribute treffen
         self.apply_phase()
         if self._single_block_mode and self._bridge_session is not None and self._bridge_block is not None:
             Clock.schedule_once(self._configure_session_from_cli, 0.1)
@@ -1596,7 +1603,7 @@ class TabletopRoot(FloatLayout):
             self.refresh_center_cards(reveal=False)
 
         start_active = phase_state.start_active
-        if self.fixation_running:
+        if getattr(self, "fixation_running", False):
             start_active = False
         ready = phase_state.ready
         btn_start_p1 = self.wid_safe('btn_start_p1')
@@ -1657,7 +1664,7 @@ class TabletopRoot(FloatLayout):
             self.log_round_start_if_pending()
             self.apply_phase()
 
-        if result.requires_fixation and not self.fixation_running:
+        if result.requires_fixation and not getattr(self, "fixation_running", False):
             self.run_fixation_sequence(proceed)
         else:
             proceed()
@@ -1870,7 +1877,7 @@ class TabletopRoot(FloatLayout):
             else:
                 start_round()
 
-        if result.requires_fixation and not self.fixation_running:
+        if result.requires_fixation and not getattr(self, "fixation_running", False):
             self.run_fixation_sequence(after_fixation)
         elif start_immediately:
             start_round()
