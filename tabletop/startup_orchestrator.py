@@ -30,6 +30,7 @@ class StartupOrchestrator:
     START_RETRIES = 3
     START_TIMEOUT_S = 4.0
     RETRY_DELAY_S = 0.8
+    CONNECT_POLL_INTERVAL_S = 0.2
 
     def __init__(self) -> None:
         self._state = StartupState.INIT
@@ -76,6 +77,12 @@ class StartupOrchestrator:
         self._notify_status_update()
 
     def begin_connect(self) -> None:
+        if self._state not in (StartupState.WAIT_SESSION, StartupState.ERROR):
+            log.debug(
+                "StartupOrchestrator: begin_connect ignoriert im Zustand %s",
+                self._state.name,
+            )
+            return
         if not self._session_id:
             log.info(
                 "StartupOrchestrator: Verbindung nicht gestartet – Session fehlt."
@@ -94,11 +101,25 @@ class StartupOrchestrator:
         self._current_start_attempt = 0
         self._transition(StartupState.CONNECTING)
         self._connect_deadline = time.monotonic() + self.CONNECT_TIMEOUT_S
+        hosts = getattr(self._bridge, "_hosts", {})
+        try:
+            detected_players = tuple(self._bridge.connected_players())
+        except Exception:  # pragma: no cover - defensive logging
+            log.debug(
+                "StartupOrchestrator: Initial connected_players lookup fehlgeschlagen",
+                exc_info=True,
+            )
+            detected_players = tuple()
+        hosts_description = ", ".join(
+            f"{player}:{host}" for player, host in sorted(hosts.items())
+        ) or "-"
         log.info(
-            "StartupOrchestrator: Verbinde Tracker (Timeout %.1fs, session=%s, block=%s)",
+            "StartupOrchestrator: Verbinde Tracker (Timeout %.1fs, session=%s, block=%s, gefundene Spieler=%d, hosts=%s)",
             self.CONNECT_TIMEOUT_S,
             self._session_id,
             self._block_id,
+            len(detected_players),
+            hosts_description,
         )
         try:
             self._bridge.connect()
@@ -202,7 +223,27 @@ class StartupOrchestrator:
         connected = self._connected_players()
         expected = self._expected_players()
         self._notify_status_update()
-        if expected and expected.issubset(connected):
+        bridge = self._bridge
+        connected_players_raw = set()
+        connected_flags: Set[str] = set()
+        if bridge is not None:
+            try:
+                connected_players_raw = {str(player) for player in bridge.connected_players() if player}
+            except Exception:  # pragma: no cover - defensive logging
+                log.debug(
+                    "StartupOrchestrator: Verbinde Poll connected_players fehlgeschlagen",
+                    exc_info=True,
+                )
+                connected_players_raw = set(connected)
+            for player in expected:
+                try:
+                    if bridge.is_connected(player):
+                        connected_flags.add(player)
+                except Exception:  # pragma: no cover - defensive logging
+                    log.debug(
+                        "StartupOrchestrator: is_connected(%s) fehlgeschlagen", player, exc_info=True
+                    )
+        if expected and expected.issubset(connected) and expected.issubset(connected_players_raw) and expected.issubset(connected_flags):
             log.info(
                 "StartupOrchestrator: Alle Tracker verbunden (%s)",
                 ", ".join(sorted(connected)),
@@ -211,7 +252,7 @@ class StartupOrchestrator:
             return
         if now >= self._connect_deadline:
             log.error("StartupOrchestrator: Verbindungsaufbau abgelaufen")
-            self._error_message = "Verbindungsaufbau abgelaufen."
+            self._error_message = "Tracker nicht erreichbar"
             self._transition(StartupState.ERROR)
             return
         log.debug(
@@ -219,7 +260,7 @@ class StartupOrchestrator:
             sorted(expected),
             sorted(connected),
         )
-        self._schedule_connect_poll(delay=self.RETRY_DELAY_S)
+        self._schedule_connect_poll(delay=self.CONNECT_POLL_INTERVAL_S)
 
     def _start_next_attempt(self) -> None:
         if self._state != StartupState.STARTING:
