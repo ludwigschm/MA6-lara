@@ -43,6 +43,7 @@ from tabletop.overlay.fixation import (
     run_fixation_sequence as overlay_run_fixation_sequence,
 )
 from tabletop.overlay.process import start_overlay_process, stop_overlay_process
+from tabletop.startup_orchestrator import StartupOrchestrator
 from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
@@ -273,16 +274,13 @@ class TabletopRoot(FloatLayout):
         self._tracker_host_pattern = re.compile(
             r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?::(?P<port>\d{1,5}))?$"
         )
+        self.startup_orchestrator = StartupOrchestrator()
         self.update_bridge_context(
             bridge=bridge,
             player=bridge_player,
             players={bridge_player} if bridge_player else None,
             session=bridge_session,
             block=bridge_block,
-        )
-        # kick recordings once Kivy has a chance to finish layout & session may be set
-        Clock.schedule_once(
-            lambda *_: self._ensure_bridge_recordings(force=True), 0.2
         )
 
         # --- UI Elemente initialisieren
@@ -343,24 +341,9 @@ class TabletopRoot(FloatLayout):
         if players_snapshot and "VP2" not in players_snapshot:
             log.info("Nur VP1 aktiv – VP2 deaktiviert")
 
-        if bridge is not None:
-            def _kick_autostart(_dt: float) -> None:
-                bridge_ref = self._bridge
-                if bridge_ref is None:
-                    return
-                selected = players_snapshot or (
-                    {self._bridge_player} if self._bridge_player else None
-                )
-                try:
-                    bridge_ref.ensure_recordings(
-                        session=self._bridge_session,
-                        block=self._bridge_block,
-                        players=selected,
-                    )
-                except AttributeError:
-                    pass
-
-            Clock.schedule_once(_kick_autostart, 0.2)
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator is not None:
+            orchestrator.attach(self, bridge)  # type: ignore[arg-type]
 
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
@@ -415,6 +398,11 @@ class TabletopRoot(FloatLayout):
             self._bridge_state_dirty = True
 
         now = time.monotonic()
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator and not orchestrator.should_attempt_recordings():
+            self._bridge_state_dirty = True
+            self._next_bridge_check = now + self._bridge_check_interval
+            return
         if not self._bridge_state_dirty and now < self._next_bridge_check:
             return
 
@@ -777,6 +765,13 @@ class TabletopRoot(FloatLayout):
                 'start_block': self.start_block,
             },
         )
+        orchestrator = getattr(self, 'startup_orchestrator', None)
+        if orchestrator is not None and self.session_id:
+            block_label = None
+            if self._bridge_block is not None:
+                block_label = str(self._bridge_block)
+            orchestrator.set_session(self.session_id, block_label)
+            orchestrator.begin_connect()
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
         self._apply_session_options_and_start()
@@ -889,10 +884,10 @@ class TabletopRoot(FloatLayout):
                 bridge.close()
             except Exception:
                 log.exception("Schließen der Bridge vor dem Reconnect fehlgeschlagen")
-            try:
-                bridge.connect()
-            except Exception:
-                log.exception("Erneute Verbindung zur Bridge fehlgeschlagen")
+            orchestrator = getattr(self, "startup_orchestrator", None)
+            if orchestrator is not None:
+                orchestrator.attach(self, bridge)
+                orchestrator.begin_connect()
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings(force=True)
 
