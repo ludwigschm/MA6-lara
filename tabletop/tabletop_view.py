@@ -262,6 +262,7 @@ class TabletopRoot(FloatLayout):
         self._bridge_block: Optional[int] = None
         self._bridge_recordings_active: set[str] = set()
         self._bridge_recording_block: Optional[int] = None
+        self._status_warnings: Dict[str, str] = {}
         self._single_block_mode = single_block_mode
         self._bridge_state_dirty = True
         self._next_bridge_check = 0.0
@@ -2171,7 +2172,36 @@ class TabletopRoot(FloatLayout):
         players_part = (
             f"Bridge: {', '.join(players)}" if players else "Bridge: keine Verbindung"
         )
-        self.status_bar_text = f"{players_part} | {queue_part}"
+        warnings = [
+            str(message)
+            for message in getattr(self, "_status_warnings", {}).values()
+            if message
+        ]
+        if warnings:
+            warning_text = " · ".join(warnings)
+            self.status_bar_text = f"⚠️ {warning_text} | {players_part} | {queue_part}"
+        else:
+            self.status_bar_text = f"{players_part} | {queue_part}"
+
+    def set_status_warning(self, key: str, message: str) -> None:
+        key_str = str(key)
+        warnings = getattr(self, "_status_warnings", {})
+        cleaned = str(message or "").strip()
+        if warnings.get(key_str) == cleaned:
+            return
+        if cleaned:
+            warnings[key_str] = cleaned
+        else:
+            warnings.pop(key_str, None)
+        self.update_status_bar()
+
+    def clear_status_warning(self, key: str) -> None:
+        warnings = getattr(self, "_status_warnings", {})
+        key_str = str(key)
+        if key_str not in warnings:
+            return
+        warnings.pop(key_str, None)
+        self.update_status_bar()
 
     def update_pause_overlay(self):
         pause_cover = self.wid_safe('pause_cover')

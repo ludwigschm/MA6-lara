@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import partial
 from enum import Enum, auto
 from typing import Iterable, Optional, TYPE_CHECKING, Set
 
@@ -31,6 +32,9 @@ class StartupOrchestrator:
     START_TIMEOUT_S = 4.0
     RETRY_DELAY_S = 0.8
     CONNECT_POLL_INTERVAL_S = 0.2
+    MONITOR_INTERVAL_S = 4.0
+    MONITOR_VERIFY_DELAY_S = 1.0
+    MONITOR_MAX_RETRIES = 3
 
     def __init__(self) -> None:
         self._state = StartupState.INIT
@@ -55,6 +59,12 @@ class StartupOrchestrator:
         self._connect_attempt = 0
         self._connect_started_at = 0.0
         self._startup_began_at = 0.0
+        self._monitor_event = None
+        self._monitor_retry_events: dict[str, object] = {}
+        self._monitor_verify_events: dict[str, object] = {}
+        self._monitor_retry_attempts: dict[str, int] = {}
+        self._monitor_failed_players: Set[str] = set()
+        self._monitor_warning_keys: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,11 +200,12 @@ class StartupOrchestrator:
             self._transition(StartupState.RUNNING)
 
     def _transition(self, new_state: StartupState) -> None:
-        if self._state == new_state:
+        old_state = self._state
+        if old_state == new_state:
             return
         log.info(
             "StartupOrchestrator: %s -> %s",
-            self._state.name,
+            old_state.name,
             new_state.name,
         )
         self._state = new_state
@@ -208,8 +219,18 @@ class StartupOrchestrator:
             self._error_message = ""
         else:
             self._log_error_state()
+        self._handle_state_transition(old_state, new_state)
         self._notify_state_changed()
         self._notify_status_update()
+
+    def _handle_state_transition(
+        self, old_state: StartupState, new_state: StartupState
+    ) -> None:
+        if new_state == StartupState.RUNNING:
+            self._start_monitoring()
+            return
+        if old_state == StartupState.RUNNING and new_state != StartupState.RUNNING:
+            self._stop_monitoring()
 
     def _notify_state_changed(self) -> None:
         root = self._root
@@ -748,4 +769,268 @@ class StartupOrchestrator:
             ",".join(sorted(recording)) or "-",
             self._state.name,
         )
+
+    # ------------------------------------------------------------------
+    # Monitoring während RUNNING
+    def _start_monitoring(self) -> None:
+        self._cancel_monitor_event()
+        self._cancel_all_monitor_player_events()
+        self._monitor_retry_attempts.clear()
+        self._monitor_failed_players.clear()
+        self._clear_all_monitor_warnings()
+        self._schedule_monitor_event(delay=self.MONITOR_INTERVAL_S)
+
+    def _stop_monitoring(self) -> None:
+        self._cancel_monitor_event()
+        self._cancel_all_monitor_player_events()
+        self._monitor_retry_attempts.clear()
+        self._monitor_failed_players.clear()
+        self._clear_all_monitor_warnings()
+
+    def _schedule_monitor_event(self, *, delay: float) -> None:
+        self._cancel_monitor_event()
+        self._monitor_event = Clock.schedule_once(self._monitor_recordings, delay)
+
+    def _cancel_monitor_event(self) -> None:
+        event = self._monitor_event
+        if event is not None:
+            try:
+                event.cancel()
+            except Exception:
+                log.debug("StartupOrchestrator: Cancel monitor event failed", exc_info=True)
+        self._monitor_event = None
+
+    def _monitor_recordings(self, _dt: float) -> None:
+        self._monitor_event = None
+        if self._state != StartupState.RUNNING:
+            return
+        players = self._monitor_player_candidates()
+        if not players:
+            self._schedule_monitor_event(delay=self.MONITOR_INTERVAL_S)
+            return
+
+        for player in players:
+            is_active = self._probe_player_recording(player)
+            if is_active:
+                if player in self._monitor_failed_players:
+                    self._handle_monitor_success(player)
+                continue
+
+            self._unmark_player_recording(player)
+
+            if player in self._monitor_failed_players:
+                continue
+            if player in self._monitor_retry_attempts:
+                continue
+            self._handle_monitor_dropout(player)
+
+        if self._state == StartupState.RUNNING:
+            self._schedule_monitor_event(delay=self.MONITOR_INTERVAL_S)
+
+    def _monitor_player_candidates(self) -> list[str]:
+        expected = sorted(self._expected_players())
+        if expected:
+            return expected
+        return ["VP1", "VP2"]
+
+    def _handle_monitor_dropout(self, player: str) -> None:
+        log.warning("StartupOrchestrator: Aufnahme %s gestoppt – starte Wiederanlauf.", player)
+        self._monitor_retry_attempts[player] = 0
+        self._schedule_monitor_retry(player, delay=0.0)
+        self._notify_status_update()
+
+    def _schedule_monitor_retry(self, player: str, *, delay: float) -> None:
+        if self._state != StartupState.RUNNING:
+            return
+        self._cancel_monitor_retry(player)
+        self._monitor_retry_events[player] = Clock.schedule_once(
+            partial(self._execute_monitor_retry, player), delay
+        )
+
+    def _cancel_monitor_retry(self, player: str) -> None:
+        event = self._monitor_retry_events.pop(player, None)
+        if event is not None:
+            try:
+                event.cancel()
+            except Exception:
+                log.debug(
+                    "StartupOrchestrator: Cancel monitor retry failed (%s)",
+                    player,
+                    exc_info=True,
+                )
+
+    def _execute_monitor_retry(self, player: str, _dt: float) -> None:
+        self._monitor_retry_events.pop(player, None)
+        if self._state != StartupState.RUNNING:
+            self._monitor_retry_attempts.pop(player, None)
+            return
+
+        attempt = self._monitor_retry_attempts.get(player, 0) + 1
+        self._monitor_retry_attempts[player] = attempt
+
+        session_value, block_value = self._resolve_session_block()
+        if session_value is None or block_value is None:
+            self._handle_monitor_failure(
+                player,
+                reason="Session oder Block fehlt",
+            )
+            return
+
+        bridge = self._bridge
+        if bridge is None:
+            self._handle_monitor_failure(player, reason="Bridge nicht verfügbar")
+            return
+
+        log.info(
+            "StartupOrchestrator: Wiederanlauf für %s (Versuch %d/%d)",
+            player,
+            attempt,
+            self.MONITOR_MAX_RETRIES,
+        )
+        try:
+            bridge.start_recording(session_value, block_value, player)
+        except Exception:
+            log.exception(
+                "StartupOrchestrator: start_recording(%s) im Wiederanlauf fehlgeschlagen",
+                player,
+            )
+
+        self._schedule_monitor_verify(player, delay=self.MONITOR_VERIFY_DELAY_S)
+
+    def _schedule_monitor_verify(self, player: str, *, delay: float) -> None:
+        if self._state != StartupState.RUNNING:
+            return
+        self._cancel_monitor_verify(player)
+        self._monitor_verify_events[player] = Clock.schedule_once(
+            partial(self._execute_monitor_verify, player), delay
+        )
+
+    def _cancel_monitor_verify(self, player: str) -> None:
+        event = self._monitor_verify_events.pop(player, None)
+        if event is not None:
+            try:
+                event.cancel()
+            except Exception:
+                log.debug(
+                    "StartupOrchestrator: Cancel monitor verify failed (%s)",
+                    player,
+                    exc_info=True,
+                )
+
+    def _execute_monitor_verify(self, player: str, _dt: float) -> None:
+        self._monitor_verify_events.pop(player, None)
+        if self._state != StartupState.RUNNING:
+            self._monitor_retry_attempts.pop(player, None)
+            return
+
+        if self._probe_player_recording(player):
+            self._handle_monitor_success(player)
+            return
+
+        attempt = self._monitor_retry_attempts.get(player, 0)
+        if attempt < self.MONITOR_MAX_RETRIES:
+            self._schedule_monitor_retry(player, delay=self.RETRY_DELAY_S)
+            return
+
+        self._handle_monitor_failure(
+            player,
+            reason=f"Nach {self.MONITOR_MAX_RETRIES} Versuchen nicht aktiv",
+        )
+
+    def _handle_monitor_success(self, player: str) -> None:
+        self._monitor_retry_attempts.pop(player, None)
+        self._monitor_failed_players.discard(player)
+        self._cancel_monitor_retry(player)
+        self._cancel_monitor_verify(player)
+        self._clear_monitor_warning(player)
+        self._mark_player_recording(player)
+        log.info(
+            "StartupOrchestrator: Aufnahme %s läuft wieder nach Wiederanlauf.",
+            player,
+        )
+        self._notify_status_update()
+
+    def _handle_monitor_failure(self, player: str, *, reason: str | None = None) -> None:
+        self._monitor_retry_attempts.pop(player, None)
+        self._monitor_failed_players.add(player)
+        self._cancel_monitor_retry(player)
+        self._cancel_monitor_verify(player)
+        message = f"Aufnahme {player} konnte nicht automatisch neu gestartet werden."
+        if reason:
+            message = f"{message} {reason}."
+        log.error("StartupOrchestrator: %s", message)
+        self._set_monitor_warning(player, message)
+        self._notify_status_update()
+
+    def _cancel_all_monitor_player_events(self) -> None:
+        for player in list(self._monitor_retry_events):
+            self._cancel_monitor_retry(player)
+        for player in list(self._monitor_verify_events):
+            self._cancel_monitor_verify(player)
+
+    def _set_monitor_warning(self, player: str, message: str) -> None:
+        root = self._root
+        if root is None:
+            return
+        key = f"recording:{player}"
+        self._monitor_warning_keys[player] = key
+        try:
+            root.set_status_warning(key, message)
+        except Exception:
+            log.debug("StartupOrchestrator: set_status_warning fehlgeschlagen", exc_info=True)
+
+    def _clear_monitor_warning(self, player: str) -> None:
+        key = self._monitor_warning_keys.pop(player, None)
+        if not key:
+            return
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.clear_status_warning(key)
+        except Exception:
+            log.debug("StartupOrchestrator: clear_status_warning fehlgeschlagen", exc_info=True)
+
+    def _clear_all_monitor_warnings(self) -> None:
+        if not self._monitor_warning_keys:
+            return
+        root = self._root
+        if root is None:
+            self._monitor_warning_keys.clear()
+            return
+        for key in list(self._monitor_warning_keys.values()):
+            try:
+                root.clear_status_warning(key)
+            except Exception:
+                log.debug("StartupOrchestrator: clear_status_warning fehlgeschlagen", exc_info=True)
+        self._monitor_warning_keys.clear()
+
+    def _probe_player_recording(self, player: str) -> bool:
+        bridge = self._bridge
+        if bridge is None:
+            return False
+        try:
+            method = getattr(bridge, "is_recording")
+        except AttributeError:
+            return False
+        try:
+            return bool(method(player))
+        except Exception:
+            log.debug(
+                "StartupOrchestrator: probe is_recording(%s) fehlgeschlagen",
+                player,
+                exc_info=True,
+            )
+            return False
+
+    def _unmark_player_recording(self, player: str) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            active = getattr(root, "_bridge_recordings_active", None)
+        except Exception:
+            active = None
+        if isinstance(active, set) and player in active:
+            active.discard(player)
 
