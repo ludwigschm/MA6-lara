@@ -44,6 +44,11 @@ class StartupOrchestrator:
         self._connect_event = None
         self._start_event = None
         self._start_retry_event = None
+        self._start_sequence_event = None
+        self._start_sequence_players: list[str] = []
+        self._start_sequence_index = 0
+        self._start_sequence_current_player: Optional[str] = None
+        self._start_sequence_started_at = 0.0
         self._error_message = ""
         self._current_start_attempt = 0
 
@@ -142,7 +147,14 @@ class StartupOrchestrator:
         self._transition(StartupState.STARTING)
         self._start_retries_left = self.START_RETRIES
         self._current_start_attempt = 0
-        self._start_next_attempt()
+        self._start_sequence_players = ["VP1", "VP2"]
+        self._start_sequence_index = 0
+        self._start_sequence_current_player = None
+        self._start_sequence_started_at = 0.0
+        self._cancel_start_poll()
+        self._cancel_start_retry()
+        self._schedule_start_sequence(delay=0.3)
+        self._notify_status_update()
 
     def is_ready(self) -> bool:
         return self._state == StartupState.READY
@@ -180,6 +192,9 @@ class StartupOrchestrator:
         self._state = new_state
         if new_state != StartupState.STARTING:
             self._current_start_attempt = 0
+            self._cancel_start_sequence_event()
+            self._start_sequence_current_player = None
+            self._start_sequence_started_at = 0.0
         if new_state != StartupState.ERROR:
             self._error_message = ""
         self._notify_state_changed()
@@ -262,32 +277,6 @@ class StartupOrchestrator:
         )
         self._schedule_connect_poll(delay=self.CONNECT_POLL_INTERVAL_S)
 
-    def _start_next_attempt(self) -> None:
-        if self._state != StartupState.STARTING:
-            return
-        if self._start_retries_left <= 0:
-            log.error("StartupOrchestrator: Recording-Start fehlgeschlagen")
-            self._error_message = "Aufnahmen konnten nicht gestartet werden."
-            self._transition(StartupState.ERROR)
-            return
-
-        self._start_retries_left -= 1
-        attempt_number = self.START_RETRIES - self._start_retries_left
-        self._current_start_attempt = attempt_number
-        log.info(
-            "StartupOrchestrator: Starte Aufnahmen (Versuch %d/%d)",
-            attempt_number,
-            self.START_RETRIES,
-        )
-        try:
-            self._root._ensure_bridge_recordings(force=True)  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover - defensive logging
-            log.exception("StartupOrchestrator: ensure_recordings fehlgeschlagen")
-        self._start_deadline = time.monotonic() + self.START_TIMEOUT_S
-        self._schedule_start_poll(delay=max(self.RETRY_DELAY_S, 0.2))
-        self._cancel_start_retry()
-        self._notify_status_update()
-
     def _schedule_start_poll(self, *, delay: float) -> None:
         self._cancel_start_poll()
         self._start_event = Clock.schedule_once(self._poll_start_status, delay)
@@ -301,30 +290,48 @@ class StartupOrchestrator:
                 log.debug("StartupOrchestrator: Cancel start poll failed", exc_info=True)
         self._start_event = None
 
+    def _schedule_start_sequence(self, *, delay: float) -> None:
+        self._cancel_start_sequence_event()
+        self._start_sequence_event = Clock.schedule_once(
+            self._start_sequence_step, delay
+        )
+
+    def _cancel_start_sequence_event(self) -> None:
+        event = self._start_sequence_event
+        if event is not None:
+            try:
+                event.cancel()
+            except Exception:
+                log.debug("StartupOrchestrator: Cancel start sequence failed", exc_info=True)
+        self._start_sequence_event = None
+
     def _poll_start_status(self, _dt: float) -> None:
+        self._start_event = None
         if self._state != StartupState.STARTING:
             return
         now = time.monotonic()
-        self._notify_status_update()
-        if self._recordings_active():
-            log.info("StartupOrchestrator: Alle Aufnahmen laufen.")
-            self._transition(StartupState.READY)
-            self._cancel_start_poll()
-            self._cancel_start_retry()
+        player = self._start_sequence_current_player
+        if player and self._player_is_recording(player):
+            self._on_player_started(player)
             return
         if now >= self._start_deadline:
             self._schedule_start_attempt_retry()
             return
-        self._schedule_start_poll(delay=self.RETRY_DELAY_S)
+        self._schedule_start_poll(delay=0.2)
 
     def _schedule_start_attempt_retry(self) -> None:
         if self._state != StartupState.STARTING:
             return
+        player = self._start_sequence_current_player
         if self._start_retries_left <= 0:
-            log.error("StartupOrchestrator: Aufnahmen konnten nicht gestartet werden")
-            self._error_message = "Aufnahmen konnten nicht gestartet werden."
-            self._transition(StartupState.ERROR)
+            self._handle_sequence_failure(player)
             return
+        if player:
+            log.warning(
+                "StartupOrchestrator: Aufnahme %s wurde nicht bestätigt – nächster Versuch in %.1fs.",
+                player,
+                self.RETRY_DELAY_S,
+            )
         self._cancel_start_retry()
         self._start_retry_event = Clock.schedule_once(
             self._execute_start_retry, self.RETRY_DELAY_S
@@ -332,6 +339,7 @@ class StartupOrchestrator:
         self._notify_status_update()
 
     def _execute_start_retry(self, _dt: float) -> None:
+        self._start_retry_event = None
         self._start_next_attempt()
 
     def _recordings_active(self) -> bool:
@@ -343,6 +351,228 @@ class StartupOrchestrator:
         if expected:
             return expected.issubset(active)
         return bool(active)
+
+    def _start_sequence_step(self, _dt: float) -> None:
+        self._start_sequence_event = None
+        if self._state != StartupState.STARTING:
+            return
+        if not self._start_sequence_players:
+            self._start_sequence_players = ["VP1", "VP2"]
+        self._start_sequence_index = 0
+        self._advance_start_sequence()
+
+    def _advance_start_sequence(self) -> None:
+        if self._state != StartupState.STARTING:
+            return
+        players = self._start_sequence_players or ["VP1", "VP2"]
+        expected = self._expected_players()
+        while self._start_sequence_index < len(players):
+            player = players[self._start_sequence_index]
+            if expected and player not in expected:
+                log.info(
+                    "StartupOrchestrator: Aufnahme %s nicht erwartet – überspringe Start.",
+                    player,
+                )
+                self._start_sequence_index += 1
+                continue
+            if self._player_is_recording(player):
+                log.info(
+                    "StartupOrchestrator: Aufnahme %s läuft bereits – überspringe Start.",
+                    player,
+                )
+                self._start_sequence_index += 1
+                self._mark_player_recording(player)
+                continue
+            self._start_sequence_current_player = player
+            self._start_sequence_started_at = 0.0
+            self._start_retries_left = self.START_RETRIES
+            self._current_start_attempt = 0
+            self._cancel_start_poll()
+            self._cancel_start_retry()
+            self._start_next_attempt()
+            return
+
+        self._start_sequence_current_player = None
+        self._finish_start_sequence()
+
+    def _start_next_attempt(self) -> None:
+        if self._state != StartupState.STARTING:
+            return
+        player = self._start_sequence_current_player
+        if not player:
+            self._finish_start_sequence()
+            return
+        if self._player_is_recording(player):
+            self._on_player_started(player)
+            return
+        if self._start_retries_left <= 0:
+            self._handle_sequence_failure(player)
+            return
+
+        attempt_number = self.START_RETRIES - self._start_retries_left + 1
+        self._current_start_attempt = attempt_number
+        if attempt_number == 1:
+            self._start_sequence_started_at = time.monotonic()
+        self._start_retries_left -= 1
+
+        session_value, block_value = self._resolve_session_block()
+        if session_value is None or block_value is None:
+            log.error(
+                "StartupOrchestrator: Session oder Block fehlt – kann Aufnahme %s nicht starten.",
+                player,
+            )
+            self._handle_sequence_failure(player, message="Session oder Block fehlt")
+            return
+
+        bridge = self._bridge
+        if bridge is None:
+            log.error(
+                "StartupOrchestrator: Keine Bridge verfügbar – Aufnahme %s kann nicht gestartet werden.",
+                player,
+            )
+            self._handle_sequence_failure(player, message="Bridge nicht verfügbar")
+            return
+
+        log.info(
+            "StartupOrchestrator: Starte Aufnahme %s (Versuch %d/%d)",
+            player,
+            self._current_start_attempt,
+            self.START_RETRIES,
+        )
+        try:
+            bridge.start_recording(session_value, block_value, player)
+        except Exception:
+            log.exception(
+                "StartupOrchestrator: start_recording(%s) fehlgeschlagen",
+                player,
+            )
+
+        self._start_deadline = time.monotonic() + self.START_TIMEOUT_S
+        self._schedule_start_poll(delay=0.2)
+        self._cancel_start_retry()
+        self._notify_status_update()
+
+    def _on_player_started(self, player: str) -> None:
+        started_at = self._start_sequence_started_at or time.monotonic()
+        elapsed_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+        log.info(
+            "StartupOrchestrator: Player %s läuft (t=%dms)",
+            player,
+            int(elapsed_ms),
+        )
+        self._mark_player_recording(player)
+        self._start_sequence_index += 1
+        self._start_sequence_current_player = None
+        self._current_start_attempt = 0
+        self._start_retries_left = self.START_RETRIES
+        self._cancel_start_poll()
+        self._cancel_start_retry()
+        self._notify_status_update()
+        self._advance_start_sequence()
+
+    def _finish_start_sequence(self) -> None:
+        expected = self._expected_players()
+        players = [
+            player
+            for player in self._start_sequence_players
+            if player and (not expected or player in expected)
+        ]
+        if players and not all(self._player_is_recording(player) for player in players):
+            self._handle_sequence_failure(None)
+            return
+        log.info("StartupOrchestrator: Alle Aufnahmen laufen.")
+        self._transition(StartupState.READY)
+        self._cancel_start_poll()
+        self._cancel_start_retry()
+
+    def _handle_sequence_failure(
+        self,
+        player: Optional[str],
+        *,
+        message: str | None = None,
+    ) -> None:
+        if player:
+            log.error(
+                "StartupOrchestrator: Aufnahme %s konnte nicht gestartet werden.",
+                player,
+            )
+            reason = f": {message}" if message else ""
+            self._error_message = f"Aufnahme {player} konnte nicht gestartet werden{reason}."
+        else:
+            log.error("StartupOrchestrator: Aufnahmen konnten nicht gestartet werden")
+            reason = f": {message}" if message else ""
+            self._error_message = f"Aufnahmen konnten nicht gestartet werden{reason}."
+        self._cancel_start_poll()
+        self._cancel_start_retry()
+        self._cancel_start_sequence_event()
+        self._start_sequence_current_player = None
+        self._transition(StartupState.ERROR)
+
+    def _player_is_recording(self, player: str) -> bool:
+        root = self._root
+        if root is not None:
+            try:
+                active = getattr(root, "_bridge_recordings_active", set())
+            except Exception:
+                active = set()
+            else:
+                if player in active:
+                    return True
+
+        bridge = self._bridge
+        if bridge is None:
+            return False
+        try:
+            method = getattr(bridge, "is_recording")
+        except AttributeError:
+            return False
+        try:
+            return bool(method(player))
+        except Exception:
+            log.debug(
+                "StartupOrchestrator: is_recording(%s) fehlgeschlagen", player, exc_info=True
+            )
+            return False
+
+    def _mark_player_recording(self, player: str) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            active = getattr(root, "_bridge_recordings_active")
+        except Exception:
+            active = None
+        if not isinstance(active, set):
+            active = set()
+            setattr(root, "_bridge_recordings_active", active)
+        active.add(player)
+        _session, block = self._resolve_session_block()
+        if block is not None:
+            try:
+                setattr(root, "_bridge_recording_block", block)
+            except Exception:
+                log.debug("StartupOrchestrator: Block-Update fehlgeschlagen", exc_info=True)
+
+    def _resolve_session_block(self) -> tuple[Optional[int], Optional[int]]:
+        def _parse(value: object) -> Optional[int]:
+            if value is None:
+                return None
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                return None
+
+        session_value = _parse(self._session_id)
+        block_value = _parse(self._block_id)
+
+        root = self._root
+        if root is not None:
+            if session_value is None:
+                session_value = _parse(getattr(root, "_bridge_session", None))
+            if block_value is None:
+                block_value = _parse(getattr(root, "_bridge_block", None))
+
+        return session_value, block_value
 
     def _cancel_start_retry(self) -> None:
         event = self._start_retry_event
