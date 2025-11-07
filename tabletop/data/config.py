@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 def load_tracker_hosts() -> dict[str, str]:
@@ -49,6 +51,61 @@ CARD_COMBINATIONS_DIR: Path = ROOT / "Kartenkombinationen"
 ARUCO_OVERLAY_PATH: Path = ROOT / "tabletop" / "aruco_overlay.py"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Runtime configuration for the tabletop application."""
+
+    overlay_enabled: bool = False
+    fullscreen_on_session: bool = False
+    tracker_hosts: dict[str, str] = field(default_factory=dict)
+    tracker_start_timeout_s: float = 8.0
+
+
+def load_app_config(
+    *,
+    overlay_enabled: Optional[bool] = None,
+    fullscreen_on_session: Optional[bool] = None,
+    tracker_start_timeout_s: Optional[float] = None,
+) -> AppConfig:
+    """Load application configuration merging environment variables and overrides."""
+
+    hosts = load_tracker_hosts()
+    default_overlay = _env_flag("NEON_OVERLAY_ENABLED", False)
+    default_fullscreen = _env_flag("NEON_FULLSCREEN_ON_SESSION", False)
+    default_timeout = _env_float("NEON_TRACKER_START_TIMEOUT", 8.0)
+
+    return AppConfig(
+        overlay_enabled=default_overlay if overlay_enabled is None else bool(overlay_enabled),
+        fullscreen_on_session=
+            default_fullscreen if fullscreen_on_session is None else bool(fullscreen_on_session),
+        tracker_hosts=hosts,
+        tracker_start_timeout_s=
+            default_timeout if tracker_start_timeout_s is None else float(tracker_start_timeout_s),
+    )
+
+
 __all__ = [
     "ROOT",
     "UX_DIR",
@@ -56,5 +113,7 @@ __all__ = [
     "CARD_COMBINATIONS_DIR",
     "ARUCO_OVERLAY_PATH",
     "load_tracker_hosts",
+    "AppConfig",
+    "load_app_config",
 ]
 
