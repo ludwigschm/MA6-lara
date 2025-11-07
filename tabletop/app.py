@@ -37,7 +37,7 @@ from tabletop.overlay.process import (
     start_overlay,
     stop_overlay,
 )
-from tabletop.tabletop_view import TabletopRoot
+from tabletop.tabletop_view import TabletopRoot, ui_wants_keyboard
 from tabletop.pupil_bridge import PupilBridge
 from tabletop.engine import EventLogger
 from tabletop.sync.reconciler import TimeReconciler
@@ -433,6 +433,19 @@ class TabletopApp(App):
             codepoint: str,
             modifiers: list[str],
         ) -> bool:
+            root = cast(Optional[TabletopRoot], self.root)
+            block_events = False
+            if root is not None:
+                try:
+                    block_events = root.should_block_keyboard_events()
+                except Exception:
+                    log.exception("Failed to evaluate keyboard gate on key down")
+                    block_events = ui_wants_keyboard(root)
+            else:
+                block_events = ui_wants_keyboard(None)
+
+            if block_events:
+                return False
             try:
                 self._emit_bridge_key_event(
                     "down",
@@ -469,6 +482,19 @@ class TabletopApp(App):
             scancode: int,
             *args: Any,
         ) -> bool:
+            root = cast(Optional[TabletopRoot], self.root)
+            block_events = False
+            if root is not None:
+                try:
+                    block_events = root.should_block_keyboard_events()
+                except Exception:
+                    log.exception("Failed to evaluate keyboard gate on key up")
+                    block_events = ui_wants_keyboard(root)
+            else:
+                block_events = ui_wants_keyboard(None)
+
+            if block_events:
+                return False
             try:
                 self._emit_bridge_key_event(
                     "up",

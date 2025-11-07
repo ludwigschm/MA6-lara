@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.properties import (
@@ -25,6 +26,7 @@ from kivy.properties import (
 )
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.modalview import ModalView
+from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT, load_tracker_hosts
@@ -63,6 +65,54 @@ from tabletop.ui.assets import (
 from tabletop.ui.widgets import CardWidget, IconButton, RotatableLabel
 
 Window.multitouch_on_demand = True
+
+
+def _iter_widget_tree(widget: Optional[Any]) -> Iterable[Any]:
+    if widget is None:
+        return
+    yield widget
+    children = getattr(widget, "children", None)
+    if not children:
+        return
+    for child in list(children):
+        yield from _iter_widget_tree(child)
+
+
+def _keyboard_context_roots(root: Optional[Any]) -> Iterable[Any]:
+    if root is not None:
+        yield root
+    try:
+        window_children = list(Window.children)
+    except Exception:
+        window_children = []
+    for child in window_children:
+        yield child
+
+
+def _any_textinput_has_focus(root: Optional[Any]) -> bool:
+    for candidate in _keyboard_context_roots(root):
+        for widget in _iter_widget_tree(candidate):
+            if isinstance(widget, TextInput) and getattr(widget, "focus", False):
+                return True
+    return False
+
+
+def _any_modal_open(root: Optional[Any]) -> bool:
+    for candidate in _keyboard_context_roots(root):
+        if isinstance(candidate, ModalView) and candidate.parent is not None:
+            return True
+        for widget in _iter_widget_tree(candidate):
+            if isinstance(widget, ModalView) and widget.parent is not None:
+                return True
+    return False
+
+
+def ui_wants_keyboard(root: Optional[Any] = None) -> bool:
+    if root is None:
+        app = App.get_running_app()
+        if app is not None:
+            root = getattr(app, "root", None)
+    return _any_modal_open(root) or _any_textinput_has_focus(root)
 
 log = logging.getLogger(__name__)
 
@@ -318,6 +368,20 @@ class TabletopRoot(FloatLayout):
         if item in self._STATE_FIELDS and 'controller' in self.__dict__:
             return getattr(self.controller.state, item)
         raise AttributeError(item)
+
+    # ------------------------------------------------------------------
+    # Keyboard gatekeeping helpers
+    def should_block_keyboard_events(self) -> bool:
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        state = None
+        if orchestrator is not None:
+            try:
+                state = orchestrator.current_state()
+            except Exception:
+                state = None
+        if state in (StartupState.INIT, StartupState.WAIT_SESSION):
+            return True
+        return ui_wants_keyboard(self)
 
     # ------------------------------------------------------------------
     # Bridge helpers
@@ -1196,6 +1260,12 @@ class TabletopRoot(FloatLayout):
         dialog.bind(on_save=self._handle_tracker_settings_save)
         dialog.bind(on_dismiss=lambda *_: self._clear_tracker_settings_dialog(dialog))
         dialog.open()
+        def _focus_vp1_input(_dt: float) -> None:
+            widget = dialog.ids.get("vp1_input")
+            if widget is not None:
+                widget.focus = True
+
+        Clock.schedule_once(_focus_vp1_input, 0)
         self._tracker_settings_dialog = dialog
 
     def _clear_tracker_settings_dialog(self, dialog: TrackerHostDialog) -> None:
@@ -2378,6 +2448,14 @@ class TabletopRoot(FloatLayout):
         session_text = existing_session or ""
         if session_input is not None:
             session_input.text = session_text
+            def _focus_session_input(_dt: float) -> None:
+                try:
+                    if session_input and session_input.parent:
+                        session_input.focus = True
+                except ReferenceError:
+                    return
+
+            Clock.schedule_once(_focus_session_input, 0)
         self.on_startup_session_text(session_text)
 
         block_text = (
