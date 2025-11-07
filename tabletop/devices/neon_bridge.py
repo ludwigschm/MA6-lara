@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import itertools
 import json
 import logging
@@ -44,6 +46,11 @@ class PupilBridge:
         self._host_log_lock = threading.Lock()
         self._host_log_path = Path.cwd() / "runs" / "neon_host_mirror.jsonl"
         self._logger.info("Neon PupilBridge initialisiert – bereit für Verbindungen.")
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever, name="NeonAsyncLoop", daemon=True
+        )
+        self._loop_thread.start()
 
     # ------------------------------------------------------------------
     # Connection handling
@@ -71,7 +78,7 @@ class PupilBridge:
                 continue
 
             try:
-                device = plrt.Device(hostname, port)
+                device = self._call_in_loop(plrt.Device, hostname, port)
             except Exception as exc:  # pragma: no cover - depends on external API
                 self._logger.warning(
                     "Neon-Tracker %s (%s) konnte nicht verbunden werden: %s",
@@ -83,7 +90,9 @@ class PupilBridge:
 
             self._devices[player] = device
             self._connected.add(player)
-            self._logger.info("Neon-Tracker %s verbunden (Host %s).", player, host)
+            self._logger.info(
+                "Neon-Tracker %s verbunden (Host %s:%s).", player, hostname, port
+            )
 
         if self._connected:
             self._start_worker()
@@ -132,6 +141,13 @@ class PupilBridge:
 
         self._devices.clear()
         self._connected.clear()
+        try:
+            if hasattr(self, "_loop"):
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                if hasattr(self, "_loop_thread"):
+                    self._loop_thread.join(timeout=1.0)
+        except Exception:
+            self._logger.debug("Async-Loop shutdown failed", exc_info=True)
         self._drain_queue()
 
     shutdown = close  # Backwards compatibility alias
@@ -967,7 +983,10 @@ class PupilBridge:
                 self._event_q.task_done()
 
     def _resolve_endpoint(self, host: str) -> tuple[str, int]:
-        parsed = urlparse(host if "://" in host else f"http://{host}")
+        cleaned = str(host).strip()
+        if cleaned.endswith("]") and cleaned.count("]") > cleaned.count("["):
+            cleaned = cleaned.rstrip("]")
+        parsed = urlparse(cleaned if "://" in cleaned else f"http://{cleaned}")
         hostname = parsed.hostname or parsed.path or host
         port = parsed.port or 8080
         return hostname, port
@@ -976,7 +995,7 @@ class PupilBridge:
         self, player: str, host: str, hostname: str, port: int
     ) -> bool:
         try:
-            with socket.create_connection((hostname, port), timeout=1.5):
+            with socket.create_connection((hostname, port), timeout=5.0):
                 return True
         except OSError as exc:
             self._logger.warning(
@@ -986,6 +1005,22 @@ class PupilBridge:
                 exc,
             )
             return False
+
+    def _call_in_loop(self, fn, *args, **kwargs):
+        """Führt fn(*args, **kwargs) im Async-Loop-Thread aus und gibt das Ergebnis zurück."""
+
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _runner() -> None:
+            try:
+                res = fn(*args, **kwargs)
+            except Exception as e:  # pragma: no cover - relies on external API
+                fut.set_exception(e)
+            else:
+                fut.set_result(res)
+
+        self._loop.call_soon_threadsafe(_runner)
+        return fut.result()
 
 
 __all__ = ["PupilBridge"]
