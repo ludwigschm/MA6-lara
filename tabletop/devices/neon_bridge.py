@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 import pupil_labs.realtime_api as plrt
 
+from .tracker_client import TrackerClient, ensure_tracker_running
+
 
 class PupilBridge:
     """Experimental Neon bridge implementation.
@@ -26,7 +28,7 @@ class PupilBridge:
     prepared for future event handling responsibilities.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, tracker_start_timeout_s: float = 8.0) -> None:
         self._logger = logging.getLogger(__name__)
         self._hosts: dict[str, str] = {}
         self._devices: dict[str, plrt.Device] = {}
@@ -45,6 +47,13 @@ class PupilBridge:
         self._host_mirror: dict[str, dict[str, dict[str, Any]]] = {}
         self._host_log_lock = threading.Lock()
         self._host_log_path = Path.cwd() / "runs" / "neon_host_mirror.jsonl"
+        self._tracker_clients: dict[str, TrackerClient] = {}
+        self._tracker_last_seen: dict[str, float] = {}
+        self._tracker_warning_gate: dict[str, float] = {}
+        self._tracker_monitor: threading.Thread | None = None
+        self._tracker_monitor_stop = threading.Event()
+        self._tracker_start_timeout = float(tracker_start_timeout_s)
+        self._marker_disabled_players: set[str] = set()
         self._logger.info("Neon PupilBridge initialisiert – bereit für Verbindungen.")
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -61,6 +70,7 @@ class PupilBridge:
             self._logger.info("Tracker-Hosts konfiguriert: %s", formatted)
         else:
             self._logger.info("Tracker-Hosts konfiguriert: (leer)")
+        self._configure_tracker_clients()
 
     def connect(self) -> None:
         if not self._hosts:
@@ -96,12 +106,14 @@ class PupilBridge:
 
         if self._connected:
             self._start_worker()
+            self._start_tracker_monitor()
         else:
             self._logger.warning(
                 "Kein Neon-Tracker erreichbar – verbleibe im Offline-Modus."
             )
 
     def close(self) -> None:
+        self._stop_tracker_monitor()
         if self._worker and self._worker.is_alive():
             self._logger.debug("Stoppe Neon-Event-Worker.")
             self._worker_stop.set()
@@ -150,6 +162,106 @@ class PupilBridge:
             self._logger.debug("Async-Loop shutdown failed", exc_info=True)
         self._drain_queue()
 
+    def _configure_tracker_clients(self) -> None:
+        self._tracker_clients.clear()
+        self._tracker_last_seen.clear()
+        if not self._hosts:
+            self._stop_tracker_monitor()
+            return
+
+        for player, host in sorted(self._hosts.items()):
+            if not host:
+                continue
+            hostname, port = self._resolve_endpoint(host)
+            self._tracker_clients[player] = TrackerClient(hostname, port)
+        if self._tracker_clients:
+            self._start_tracker_monitor()
+        else:
+            self._stop_tracker_monitor()
+
+    def _start_tracker_monitor(self) -> None:
+        if self._tracker_monitor and self._tracker_monitor.is_alive():
+            return
+        if not self._tracker_clients:
+            return
+        self._tracker_monitor_stop.clear()
+        self._tracker_monitor = threading.Thread(
+            target=self._tracker_monitor_loop,
+            name="TrackerMonitor",
+            daemon=True,
+        )
+        self._tracker_monitor.start()
+
+    def _stop_tracker_monitor(self) -> None:
+        monitor = self._tracker_monitor
+        if monitor and monitor.is_alive():
+            self._tracker_monitor_stop.set()
+            monitor.join(timeout=2.0)
+        self._tracker_monitor = None
+        self._tracker_monitor_stop.clear()
+
+    def _tracker_monitor_loop(self) -> None:
+        poll_interval = 1.5
+        while not self._tracker_monitor_stop.is_set():
+            cycle_start = time.monotonic()
+            for player, client in list(self._tracker_clients.items()):
+                if self._tracker_monitor_stop.is_set():
+                    break
+                status = client.status()
+                now = time.monotonic()
+                if status:
+                    self._tracker_last_seen[player] = now
+                    continue
+                last_ok = self._tracker_last_seen.get(player, 0.0)
+                if now - last_ok < max(3.0, self._tracker_start_timeout):
+                    continue
+                if ensure_tracker_running(
+                    client,
+                    start_timeout=self._tracker_start_timeout,
+                    logger=self._logger,
+                ):
+                    self._tracker_last_seen[player] = time.monotonic()
+                    time.sleep(0.3)
+                    continue
+                self._throttled_log(
+                    f"Tracker {player} nicht erreichbar – erneuter Versuch folgt.",
+                    key=f"tracker:{player}",
+                    level=logging.WARNING,
+                )
+                time.sleep(0.5)
+
+            elapsed = time.monotonic() - cycle_start
+            wait_for = max(0.5, poll_interval - elapsed)
+            self._tracker_monitor_stop.wait(wait_for)
+
+    def _throttled_log(
+        self,
+        message: str,
+        *,
+        key: str,
+        level: int = logging.INFO,
+        interval: float = 30.0,
+    ) -> None:
+        now = time.monotonic()
+        last = self._tracker_warning_gate.get(key, 0.0)
+        if now - last >= interval:
+            self._logger.log(level, message)
+            self._tracker_warning_gate[key] = now
+
+    def _marker_interface_missing(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "keine marker" in message or "marker-schnittstelle" in message
+
+    def _disable_marker_for(self, player: str) -> None:
+        if player in self._marker_disabled_players:
+            return
+        self._marker_disabled_players.add(player)
+        self._throttled_log(
+            "Marker-Interface nicht verfügbar – verwende HTTP-Start.",
+            key=f"marker:{player}",
+            level=logging.WARNING,
+        )
+
     shutdown = close  # Backwards compatibility alias
 
     # ------------------------------------------------------------------
@@ -194,11 +306,37 @@ class PupilBridge:
             if not self._is_recording(player):
                 self.start_recording(session, block, player)
 
+    def _ensure_tracker_ready(self, player: str) -> bool:
+        client = self._tracker_clients.get(player)
+        if client is None:
+            return True
+        ready = ensure_tracker_running(
+            client,
+            start_timeout=self._tracker_start_timeout,
+            logger=self._logger,
+        )
+        if ready:
+            self._tracker_last_seen[player] = time.monotonic()
+            return True
+        self._throttled_log(
+            f"Tracker {player} konnte nicht in den Streaming-Zustand versetzt werden.",
+            key=f"tracker-fail:{player}",
+            level=logging.ERROR,
+        )
+        return False
+
     def start_recording(self, session: int, block: int, player: str) -> None:
         device = self._devices.get(player)
         if device is None:
             self._logger.warning(
                 "Start der Aufnahme für Spieler %s übersprungen – kein verbundenes Gerät.",
+                player,
+            )
+            return
+
+        if not self._ensure_tracker_ready(player):
+            self._logger.error(
+                "Tracker %s konnte nicht per HTTP gestartet werden – Aufnahme wird übersprungen.",
                 player,
             )
             return
@@ -769,7 +907,9 @@ class PupilBridge:
                     continue
 
                 payload_dict = payload if isinstance(payload, dict) else {}
-                if not self._send_marker_with_retry(device, name, payload_dict):
+                if player in self._marker_disabled_players:
+                    continue
+                if not self._send_marker_with_retry(player, device, name, payload_dict):
                     self._logger.warning(
                         "Marker %s für Spieler %s konnte nach mehreren Versuchen nicht gesendet werden.",
                         name,
@@ -783,7 +923,7 @@ class PupilBridge:
         self._logger.debug("Neon-Event-Worker beendet.")
 
     def _send_marker_with_retry(
-        self, device: plrt.Device, name: str, payload: Dict[str, object]
+        self, player: str, device: plrt.Device, name: str, payload: Dict[str, object]
     ) -> bool:
         max_attempts = 3
         delay = max(0.02, float(self._event_retry_base))
@@ -791,6 +931,9 @@ class PupilBridge:
             try:
                 self._emit_marker(device, name, payload)
             except Exception as exc:  # pragma: no cover - depends on external API
+                if self._marker_interface_missing(exc):
+                    self._disable_marker_for(player)
+                    return True
                 if attempt >= max_attempts or not self._is_transient_error(exc):
                     self._logger.debug(
                         "Marker-Senden fehlgeschlagen (Versuch %d/%d): %s",

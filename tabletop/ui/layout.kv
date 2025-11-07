@@ -530,8 +530,8 @@
                         id: startup_play_button
                         text: 'Play'
                         font_size: 28 * root.scale if root.scale else 28
-                        disabled: True
-                        opacity: 0.5
+                        disabled: not app.connection_ready
+                        opacity: 1.0 if app.connection_ready else 0.5
                         on_release: root.handle_startup_play()
 
     BoxLayout:

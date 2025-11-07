@@ -27,6 +27,7 @@ class PupilBridge:
     _hosts: Dict[str, str] = field(default_factory=dict)
     _mirror: Dict[str, Dict[str, Dict[str, object]]] = field(default_factory=dict)
     _recording: Dict[str, bool] = field(default_factory=dict)
+    tracker_start_timeout_s: float = 8.0
 
     # ------------------------------------------------------------------
     # Connection handling

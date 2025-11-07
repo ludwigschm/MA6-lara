@@ -19,22 +19,24 @@ import logging
 
 from kivy.app import App
 from kivy.config import Config
+from kivy.properties import BooleanProperty
 
 Config.set("graphics", "multisamples", "0")
 Config.set("graphics", "maxfps", "60")
 Config.set("graphics", "vsync", "1")
 Config.set("kivy", "exit_on_escape", "0")
+Config.set("kivy", "keyboard_mode", "systemanddock")
+Config.set("graphics", "fullscreen", "0")
 Config.write()
 
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
 
-from tabletop.data.config import ARUCO_OVERLAY_PATH, load_tracker_hosts
+from tabletop.data.config import load_app_config
 from tabletop.logging.round_csv import close_round_log, flush_round_log
 from tabletop.overlay.process import (
     OverlayProcess,
-    start_overlay,
     stop_overlay,
 )
 from tabletop.tabletop_view import TabletopRoot, ui_wants_keyboard
@@ -54,6 +56,8 @@ _KV_LOADED = False
 class TabletopApp(App):
     """Main Kivy application that wires the UI with infrastructure services."""
 
+    connection_ready = BooleanProperty(False)
+
     def __init__(
         self,
         *,
@@ -64,6 +68,8 @@ class TabletopApp(App):
         bridge: Optional[PupilBridge] = None,
         single_block_mode: bool = False,
         logging_queue: Optional[Queue] = None,
+        overlay_enabled: bool = False,
+        fullscreen_on_session: bool = False,
         **kwargs: Any,
     ) -> None:
         self._overlay_process: Optional[OverlayProcess] = None
@@ -100,6 +106,8 @@ class TabletopApp(App):
         self._frame_log_event = None
         self._queue_monitor_event = None
         self._last_queue_warning = 0.0
+        self._overlay_enabled_default = bool(overlay_enabled)
+        self._fullscreen_on_session = bool(fullscreen_on_session)
         super().__init__(**kwargs)
 
     @staticmethod
@@ -319,6 +327,10 @@ class TabletopApp(App):
             single_block_mode=self._single_block_mode,
             perf_logging=self._perf_logging,
         )
+        try:
+            root.aruco_enabled = bool(self._overlay_enabled_default)
+        except AttributeError:
+            pass
         # propagate multi-player context so the view can start/stop recordings for all
         try:
             root.update_bridge_context(
@@ -331,6 +343,7 @@ class TabletopApp(App):
             pass
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
+        self.connection_ready = False
         return root
 
     # ------------------------------------------------------------------
@@ -605,6 +618,38 @@ class TabletopApp(App):
         if callable(cancel):
             cancel()
 
+    def _on_root_session_configured(self, _root: TabletopRoot, value: Any) -> None:
+        should_fullscreen = bool(value) and self._fullscreen_on_session
+        if should_fullscreen:
+            Clock.schedule_once(lambda *_: self._enter_fullscreen(), 0.0)
+        else:
+            Clock.schedule_once(lambda *_: self._exit_fullscreen(), 0.0)
+
+    def _enter_fullscreen(self) -> None:
+        root = cast(Optional[TabletopRoot], self.root)
+        try:
+            self._target_display_index = self._move_window_to_display(
+                self._target_display_index
+            )
+            if root is not None:
+                try:
+                    root.overlay_display_index = self._target_display_index
+                except AttributeError:
+                    pass
+            Window.borderless = True
+            Window.fullscreen = "auto"
+            log.info("Fullscreen engaged (auto).")
+        except Exception as exc:  # pragma: no cover - safety net
+            log.exception("Failed to enter fullscreen: %s", exc)
+
+    def _exit_fullscreen(self) -> None:
+        try:
+            Window.fullscreen = False
+            Window.borderless = False
+            log.info("Fullscreen disabled.")
+        except Exception as exc:  # pragma: no cover - safety net
+            log.exception("Failed to leave fullscreen: %s", exc)
+
     def on_start(self) -> None:  # pragma: no cover - framework callback
         super().on_start()
         root = cast(Optional[TabletopRoot], self.root)
@@ -627,49 +672,11 @@ class TabletopApp(App):
                 root.overlay_display_index = self._target_display_index
             except AttributeError:
                 pass
+            root.overlay_process = self._overlay_process
+            root.bind(session_configured=self._on_root_session_configured)
+            self._on_root_session_configured(root, root.session_configured)
 
-        def _start_overlay_late(_dt: float) -> None:
-            process_handle: Optional[OverlayProcess]
-            if root and getattr(root, "overlay_process", None):
-                process_handle = cast(Optional[OverlayProcess], root.overlay_process)
-            else:
-                process_handle = self._overlay_process
-
-            try:
-                process_handle = start_overlay(
-                    process_handle,
-                    overlay_path=ARUCO_OVERLAY_PATH,
-                    display_index=self._target_display_index,
-                )
-            except Exception as exc:  # pragma: no cover - safety net
-                log.exception("Overlay start failed: %s", exc)
-                return
-
-            self._overlay_process = process_handle
-            if root is not None:
-                root.overlay_process = process_handle
-            log.info("Overlay started after fullscreen.")
-
-        def _enter_fullscreen(_dt: float) -> None:
-            try:
-                self._target_display_index = self._move_window_to_display(
-                    self._target_display_index
-                )
-                if root is not None:
-                    try:
-                        root.overlay_display_index = self._target_display_index
-                    except AttributeError:
-                        pass
-                Window.borderless = True
-                Window.fullscreen = "auto"
-                log.info("Fullscreen engaged (auto).")
-            except Exception as exc:  # pragma: no cover - safety net
-                log.exception("Failed to enter fullscreen: %s", exc)
-
-            self._bind_esc()
-            Clock.schedule_once(_start_overlay_late, 0.25)
-
-        Clock.schedule_once(_enter_fullscreen, 0.0)
+        self._bind_esc()
 
         if self._perf_logging:
             self._frame_samples.clear()
@@ -691,6 +698,8 @@ class TabletopApp(App):
         self._frame_sampler = None
         self._frame_log_event = None
         self._queue_monitor_event = None
+
+        self._exit_fullscreen()
 
         process_handle: Optional[OverlayProcess]
         if root and getattr(root, "overlay_process", None):
@@ -894,13 +903,20 @@ def main(
     session: Optional[int] = None,
     block: Optional[int] = None,
     player: str = "auto",
+    overlay: Optional[bool] = None,
+    fullscreen: Optional[bool] = None,
 ) -> None:
     """Run the tabletop Kivy application with optional Pupil bridge integration."""
 
     logging_listener, logging_queue = _configure_async_logging()
 
-    bridge = PupilBridge()
-    bridge.configure_hosts(load_tracker_hosts())
+    config = load_app_config(
+        overlay_enabled=overlay,
+        fullscreen_on_session=fullscreen,
+    )
+
+    bridge = PupilBridge(tracker_start_timeout_s=config.tracker_start_timeout_s)
+    bridge.configure_hosts(config.tracker_hosts)
     try:
         bridge.connect()
     except Exception:  # pragma: no cover - defensive fallback
@@ -923,6 +939,8 @@ def main(
         bridge=bridge,
         single_block_mode=single_block_mode,
         logging_queue=logging_queue,
+        overlay_enabled=config.overlay_enabled,
+        fullscreen_on_session=config.fullscreen_on_session,
     )
     try:
         app.run()
@@ -946,6 +964,31 @@ if __name__ == "__main__":  # pragma: no cover - manual execution
     parser.add_argument("--block", type=int, default=None, help="Block identifier")
     parser.add_argument("--player", default="auto", help="Player to control (VP1/VP2/both)")
     parser.add_argument(
+        "--overlay",
+        dest="overlay",
+        action="store_true",
+        help="Enable the optional ArUco marker overlay.",
+    )
+    parser.add_argument(
+        "--no-overlay",
+        dest="overlay",
+        action="store_false",
+        help="Disable the optional ArUco marker overlay.",
+    )
+    parser.add_argument(
+        "--fullscreen",
+        dest="fullscreen",
+        action="store_true",
+        help="Enter fullscreen automatically once the session starts.",
+    )
+    parser.add_argument(
+        "--windowed",
+        dest="fullscreen",
+        action="store_false",
+        help="Keep the application windowed (default).",
+    )
+    parser.set_defaults(overlay=None, fullscreen=None)
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="Run the latency/refinement demo instead of launching the UI",
@@ -954,4 +997,10 @@ if __name__ == "__main__":  # pragma: no cover - manual execution
     if args.demo:
         run_demo()
     else:
-        main(session=args.session, block=args.block, player=args.player)
+        main(
+            session=args.session,
+            block=args.block,
+            player=args.player,
+            overlay=args.overlay,
+            fullscreen=args.fullscreen,
+        )

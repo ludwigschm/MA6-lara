@@ -941,6 +941,12 @@ class TabletopRoot(FloatLayout):
         if button is None:
             return
         enabled = self._startup_can_play()
+        app = App.get_running_app()
+        if app is not None and hasattr(app, "connection_ready"):
+            try:
+                app.connection_ready = bool(enabled)
+            except Exception:
+                pass
         button.disabled = not enabled
         button.opacity = 1.0 if enabled else 0.5
 
