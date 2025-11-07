@@ -305,7 +305,7 @@
                 size: self.size
         RotatableLabel:
             id: intro_label_p1
-            text: '[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button'
+            text: '[b]Willkommen![/b]\nBitte warten Sie, bis die Session gestartet wurde.'
             halign: 'center'
             valign: 'middle'
             color: 0, 0, 0, 1
@@ -318,7 +318,7 @@
             font_size: 64 * root.scale if root.scale else 64
         RotatableLabel:
             id: intro_label_p2
-            text: '[b]Willkommen![/b]\nUm zu Beginnen drücken Sie bitte auf den Play-Button'
+            text: '[b]Willkommen![/b]\nBitte warten Sie, bis die Session gestartet wurde.'
             halign: 'center'
             valign: 'middle'
             color: 0, 0, 0, 1
@@ -329,6 +329,210 @@
             text_size: self.width - 2 * 40 * root.scale, self.height - 2 * 40 * root.scale
             padding: 40 * root.scale, 40 * root.scale
             font_size: 64 * root.scale if root.scale else 64
+        AnchorLayout:
+            id: startup_anchor
+            size_hint: 1, 1
+            anchor_x: 'center'
+            anchor_y: 'center'
+            BoxLayout:
+                id: startup_panel
+                orientation: 'vertical'
+                size_hint: None, None
+                width: min(root.width * 0.6, 880 * root.scale if root.scale else 880)
+                height: self.minimum_height
+                padding: 32 * root.scale, 32 * root.scale
+                spacing: 18 * root.scale
+                canvas.before:
+                    Color:
+                        rgba: 0.08, 0.08, 0.08, 0.92
+                    RoundedRectangle:
+                        pos: self.pos
+                        size: self.size
+                        radius: [24 * root.scale if root.scale else 24]
+
+                Label:
+                    text: 'Session Setup'
+                    font_size: 48 * root.scale if root.scale else 48
+                    size_hint_y: None
+                    height: self.texture_size[1]
+                    color: 1, 1, 1, 1
+                    bold: True
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: self.size
+
+                TextInput:
+                    id: startup_session_input
+                    hint_text: 'Session ID'
+                    multiline: False
+                    write_tab: False
+                    size_hint_y: None
+                    height: 60 * root.scale if root.scale else 60
+                    font_size: 32 * root.scale if root.scale else 32
+                    on_text: root.on_startup_session_text(self.text)
+
+                TextInput:
+                    id: startup_block_input
+                    hint_text: 'Block ID (optional)'
+                    multiline: False
+                    write_tab: False
+                    size_hint_y: None
+                    height: 60 * root.scale if root.scale else 60
+                    font_size: 32 * root.scale if root.scale else 32
+                    on_text: root.on_startup_block_text(self.text)
+
+                GridLayout:
+                    cols: 2
+                    size_hint_y: None
+                    height: self.minimum_height
+                    col_default_width: self.width / 2
+                    col_force_default: False
+                    row_default_height: 60 * root.scale if root.scale else 60
+                    row_force_default: True
+                    spacing: 16 * root.scale
+
+                    Label:
+                        text: 'Aruco-Overlay aktivieren'
+                        color: 1, 1, 1, 1
+                        font_size: 28 * root.scale if root.scale else 28
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    Switch:
+                        id: startup_overlay_switch
+                        size_hint_x: None
+                        width: 120 * root.scale if root.scale else 120
+
+                    Label:
+                        text: 'Startblock (1=Übung, 2–5=Experimental)'
+                        color: 1, 1, 1, 1
+                        font_size: 28 * root.scale if root.scale else 28
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                    Spinner:
+                        id: startup_start_block_spinner
+                        text: '1'
+                        values: [str(i) for i in range(1, 6)]
+                        size_hint: None, None
+                        size: 160 * root.scale if root.scale else 160, 60 * root.scale if root.scale else 60
+
+                Label:
+                    id: startup_error_label
+                    text: ''
+                    color: (1, 0.35, 0.35, 1)
+                    size_hint_y: None
+                    height: self.texture_size[1] + (10 if self.text else 0)
+                    font_size: 24 * root.scale if root.scale else 24
+                    halign: 'left'
+                    valign: 'middle'
+                    text_size: self.size
+
+                BoxLayout:
+                    id: startup_status_container
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: 6 * root.scale
+
+                    Label:
+                        id: startup_status_connect
+                        text: 'Verbinde Tracker…'
+                        color: 1, 1, 1, 1
+                        font_size: 28 * root.scale if root.scale else 28
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_y: None
+                        height: self.texture_size[1]
+
+                    Label:
+                        id: startup_status_vp1
+                        text: 'Starte Aufnahme VP1…'
+                        color: 1, 1, 1, 1
+                        font_size: 28 * root.scale if root.scale else 28
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_y: None
+                        height: self.texture_size[1]
+
+                    Label:
+                        id: startup_status_vp2
+                        text: 'Starte Aufnahme VP2…'
+                        color: 1, 1, 1, 1
+                        font_size: 28 * root.scale if root.scale else 28
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        size_hint_y: None
+                        height: self.texture_size[1]
+
+                BoxLayout:
+                    id: startup_progress_row
+                    size_hint_y: None
+                    height: 40 * root.scale if root.scale else 40
+                    spacing: 12 * root.scale
+
+                    Label:
+                        id: startup_progress_label
+                        text: '⏳'
+                        color: 1, 1, 1, 1
+                        font_size: 32 * root.scale if root.scale else 32
+                        size_hint_x: None
+                        width: self.texture_size[0]
+                        opacity: 0
+
+                    Label:
+                        id: startup_progress_text
+                        text: 'Bitte warten…'
+                        color: 1, 1, 1, 1
+                        font_size: 24 * root.scale if root.scale else 24
+                        halign: 'left'
+                        valign: 'middle'
+                        text_size: self.size
+                        opacity: 0
+
+                    Widget:
+                        size_hint_x: 1
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: 60 * root.scale if root.scale else 60
+                    spacing: 12 * root.scale
+
+                    Button:
+                        id: startup_retry_button
+                        text: 'Erneut versuchen'
+                        size_hint_x: None
+                        width: 240 * root.scale if root.scale else 240
+                        font_size: 24 * root.scale if root.scale else 24
+                        opacity: 0
+                        disabled: True
+                        on_release: root.handle_startup_retry()
+
+                    Widget:
+                        size_hint_x: 1
+
+                BoxLayout:
+                    size_hint_y: None
+                    height: 60 * root.scale if root.scale else 60
+                    spacing: 12 * root.scale
+
+                    Button:
+                        id: startup_ok_button
+                        text: 'OK'
+                        font_size: 28 * root.scale if root.scale else 28
+                        disabled: not root.startup_session_valid
+                        on_release: root.handle_startup_ok()
+
+                    Button:
+                        id: startup_play_button
+                        text: 'Play'
+                        font_size: 28 * root.scale if root.scale else 28
+                        disabled: True
+                        opacity: 0.5
+                        on_release: root.handle_startup_play()
 
     BoxLayout:
         id: status_bar_container

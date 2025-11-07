@@ -16,16 +16,15 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional,
 import numpy as np
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.properties import DictProperty, NumericProperty, ObjectProperty, StringProperty
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
+from kivy.properties import (
+    BooleanProperty,
+    DictProperty,
+    NumericProperty,
+    ObjectProperty,
+    StringProperty,
+)
 from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
-from kivy.uix.popup import Popup
-from kivy.uix.spinner import Spinner
-from kivy.uix.switch import Switch
-from kivy.uix.textinput import TextInput
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT, load_tracker_hosts
@@ -43,7 +42,7 @@ from tabletop.overlay.fixation import (
     run_fixation_sequence as overlay_run_fixation_sequence,
 )
 from tabletop.overlay.process import start_overlay_process, stop_overlay_process
-from tabletop.startup_orchestrator import StartupOrchestrator
+from tabletop.startup_orchestrator import StartupOrchestrator, StartupState
 from tabletop.state.controller import TabletopController, TabletopState
 from tabletop.state.phases import UXPhase, to_engine_phase
 from tabletop.ui import widgets as ui_widgets
@@ -155,6 +154,7 @@ class TabletopRoot(FloatLayout):
     intro_labels = DictProperty({})
     pause_labels = DictProperty({})
     status_bar_text = StringProperty("Bridge: -- | Queue: --")
+    startup_session_valid = BooleanProperty(False)
 
     def wid(self, name: str):
         # Liefert das Widget-Objekt oder None, ohne Truthiness auf WeakProxy auszulösen
@@ -229,13 +229,17 @@ class TabletopRoot(FloatLayout):
         self.session_storage_id = None
         self.logger = None
         self.log_dir = Path(ROOT) / 'logs'
-        self.session_popup = None
         self.session_configured = False
         self.round_log_path = None
         self.round_log_fp = None
         self.round_log_writer = None
         self.round_log_buffer = []
         self.overlay_display_index = 0
+        self.startup_session_valid = False
+        self._startup_session_value = ""
+        self._startup_block_value = ""
+        self._startup_last_block_label: Optional[str] = None
+        self._startup_error_manual = False
 
         self._low_latency_disabled = is_low_latency_disabled()
         self.perf_logging = (
@@ -348,6 +352,7 @@ class TabletopRoot(FloatLayout):
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
         self._ensure_time_reconciler()
+        self._update_startup_status_ui()
         if self.session_configured:
             self._schedule_sync_heartbeat(immediate=False)
 
@@ -391,60 +396,63 @@ class TabletopRoot(FloatLayout):
         self._bridge_state_dirty = True
 
     def _ensure_bridge_recordings(self, *_: Any, force: bool = False) -> None:
-        if not self._bridge or not self.session_configured:
-            return
+        try:
+            if not self._bridge or not self.session_configured:
+                return
 
-        if force:
-            self._bridge_state_dirty = True
+            if force:
+                self._bridge_state_dirty = True
 
-        now = time.monotonic()
-        orchestrator = getattr(self, "startup_orchestrator", None)
-        if orchestrator and not orchestrator.should_attempt_recordings():
-            self._bridge_state_dirty = True
+            now = time.monotonic()
+            orchestrator = getattr(self, "startup_orchestrator", None)
+            if orchestrator and not orchestrator.should_attempt_recordings():
+                self._bridge_state_dirty = True
+                self._next_bridge_check = now + self._bridge_check_interval
+                return
+            if not self._bridge_state_dirty and now < self._next_bridge_check:
+                return
+
+            if self._bridge_session is None and self.session_number is not None:
+                self._bridge_session = self.session_number
+
+            current_block = self._current_bridge_block_index()
+            if current_block is not None:
+                self._bridge_block = current_block
+
+            session_value = self._bridge_session
+            block_value = self._bridge_block
+            if session_value is None or block_value is None:
+                self._bridge_state_dirty = True
+                self._next_bridge_check = now + self._bridge_check_interval
+                return
+
+            if (
+                self._bridge_recording_block is not None
+                and block_value != self._bridge_recording_block
+                and self._bridge_recordings_active
+            ):
+                self.stop_bridge_recordings()
+
+            players = self._bridge_ready_players()
+            if not players:
+                self._bridge_state_dirty = True
+                self._next_bridge_check = now + self._bridge_check_interval
+                return
+
+            for player in players:
+                if player in self._bridge_recordings_active:
+                    continue
+                self._bridge.start_recording(session_value, block_value, player)
+                self._bridge_recordings_active.add(player)
+
+            if self._bridge_recordings_active:
+                self._bridge_recording_block = block_value
+                self._bridge_state_dirty = False
+            else:
+                self._bridge_state_dirty = True
             self._next_bridge_check = now + self._bridge_check_interval
-            return
-        if not self._bridge_state_dirty and now < self._next_bridge_check:
-            return
-
-        if self._bridge_session is None and self.session_number is not None:
-            self._bridge_session = self.session_number
-
-        current_block = self._current_bridge_block_index()
-        if current_block is not None:
-            self._bridge_block = current_block
-
-        session_value = self._bridge_session
-        block_value = self._bridge_block
-        if session_value is None or block_value is None:
-            self._bridge_state_dirty = True
-            self._next_bridge_check = now + self._bridge_check_interval
-            return
-
-        if (
-            self._bridge_recording_block is not None
-            and block_value != self._bridge_recording_block
-            and self._bridge_recordings_active
-        ):
-            self.stop_bridge_recordings()
-
-        players = self._bridge_ready_players()
-        if not players:
-            self._bridge_state_dirty = True
-            self._next_bridge_check = now + self._bridge_check_interval
-            return
-
-        for player in players:
-            if player in self._bridge_recordings_active:
-                continue
-            self._bridge.start_recording(session_value, block_value, player)
-            self._bridge_recordings_active.add(player)
-
-        if self._bridge_recordings_active:
-            self._bridge_recording_block = block_value
-            self._bridge_state_dirty = False
-        else:
-            self._bridge_state_dirty = True
-        self._next_bridge_check = now + self._bridge_check_interval
+        finally:
+            self._update_startup_status_ui()
 
     def _log_async_metrics(self, _dt: float) -> None:
         if not self.perf_logging:
@@ -467,11 +475,13 @@ class TabletopRoot(FloatLayout):
     def stop_bridge_recordings(self) -> None:
         if not self._bridge_recordings_active:
             self._bridge_recording_block = None
+            self._update_startup_status_ui()
             return
 
         if not self._bridge:
             self._bridge_recordings_active.clear()
             self._bridge_recording_block = None
+            self._update_startup_status_ui()
             return
 
         for player in list(self._bridge_recordings_active):
@@ -482,6 +492,7 @@ class TabletopRoot(FloatLayout):
 
         self._bridge_recording_block = None
         self._mark_bridge_dirty()
+        self._update_startup_status_ui()
 
     def _resolve_event_logger(self) -> Optional[EventLogger]:
         logger_obj = getattr(self, "logger", None)
@@ -765,13 +776,6 @@ class TabletopRoot(FloatLayout):
                 'start_block': self.start_block,
             },
         )
-        orchestrator = getattr(self, 'startup_orchestrator', None)
-        if orchestrator is not None and self.session_id:
-            block_label = None
-            if self._bridge_block is not None:
-                block_label = str(self._bridge_block)
-            orchestrator.set_session(self.session_id, block_label)
-            orchestrator.begin_connect()
         self._mark_bridge_dirty()
         self._ensure_bridge_recordings()
         self._apply_session_options_and_start()
@@ -788,6 +792,256 @@ class TabletopRoot(FloatLayout):
             start_block_value=start_block_value,
             aruco_enabled=self.aruco_enabled,
         )
+        block_label = None
+        if self._bridge_block is not None:
+            block_label = str(self._bridge_block)
+        self._trigger_startup_sequence(str(self._bridge_session), block_label)
+
+    def _trigger_startup_sequence(
+        self, session_label: str, block_label: Optional[str]
+    ) -> None:
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator is None or not session_label:
+            self._update_startup_status_ui()
+            return
+        self._startup_last_block_label = block_label
+        if block_label:
+            with suppress(ValueError, TypeError):
+                self._bridge_block = int(block_label)
+        orchestrator.set_session(session_label, block_label)
+        orchestrator.begin_connect()
+        self._update_startup_status_ui()
+
+    def on_startup_session_text(self, text: str) -> None:
+        value = (text or "").strip()
+        self._startup_session_value = value
+        was_valid = bool(self.startup_session_valid)
+        is_valid = bool(value)
+        if was_valid != is_valid:
+            self.startup_session_valid = is_valid
+        if value:
+            self._set_startup_error("", manual=False)
+
+    def on_startup_block_text(self, text: str) -> None:
+        self._startup_block_value = (text or "").strip()
+
+    def _set_startup_error(self, message: str, *, manual: bool = True) -> None:
+        self._startup_error_manual = manual and bool(message)
+        label = self.wid_safe("startup_error_label")
+        if label is not None:
+            label.text = message
+
+    def _startup_expected_players(self) -> set[str]:
+        players: set[str] = set()
+        for value in getattr(self, "_bridge_players", set()):
+            if value:
+                players.add(str(value))
+        fallback = getattr(self, "_bridge_player", None)
+        if fallback:
+            players.add(str(fallback))
+        return players
+
+    def _startup_can_play(self) -> bool:
+        if not self.session_configured:
+            return False
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator is None:
+            return True
+        try:
+            state = orchestrator.current_state()
+        except Exception:
+            return False
+        return state in (StartupState.READY, StartupState.RUNNING)
+
+    def _update_startup_play_button(self) -> None:
+        button = self.wid_safe("startup_play_button")
+        if button is None:
+            return
+        enabled = self._startup_can_play()
+        button.disabled = not enabled
+        button.opacity = 1.0 if enabled else 0.5
+
+    def _update_startup_status_ui(self) -> None:
+        connect_label = self.wid_safe("startup_status_connect")
+        status_vp1 = self.wid_safe("startup_status_vp1")
+        status_vp2 = self.wid_safe("startup_status_vp2")
+        progress_label = self.wid_safe("startup_progress_label")
+        progress_text = self.wid_safe("startup_progress_text")
+        retry_button = self.wid_safe("startup_retry_button")
+
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        state: Optional[StartupState]
+        attempt = 0
+        max_attempts = 0
+        error_message = ""
+        if orchestrator is None:
+            state = None
+        else:
+            try:
+                state = orchestrator.current_state()
+            except Exception:
+                state = None
+            try:
+                attempt = orchestrator.current_start_attempt()
+            except Exception:
+                attempt = 0
+            try:
+                max_attempts = int(getattr(orchestrator, "START_RETRIES", 0))
+            except Exception:
+                max_attempts = 0
+            try:
+                error_message = orchestrator.error_message()
+            except Exception:
+                error_message = ""
+
+        expected = self._startup_expected_players()
+        try:
+            connected = set(self._bridge_ready_players()) if orchestrator else set()
+        except Exception:
+            connected = set()
+        recordings = set(getattr(self, "_bridge_recordings_active", set()))
+
+        if state == StartupState.ERROR and error_message:
+            self._set_startup_error(error_message, manual=False)
+        elif not self._startup_error_manual:
+            self._set_startup_error("", manual=False)
+
+        show_progress = state in (StartupState.CONNECTING, StartupState.STARTING)
+        progress_message = "Bitte warten…"
+        if state == StartupState.CONNECTING:
+            progress_message = "Verbinde Tracker…"
+        elif state == StartupState.STARTING:
+            progress_message = "Starte Aufnahmen…"
+        if progress_label is not None:
+            progress_label.opacity = 1.0 if show_progress else 0.0
+        if progress_text is not None:
+            progress_text.opacity = 1.0 if show_progress else 0.0
+            if show_progress:
+                progress_text.text = progress_message
+
+        if retry_button is not None:
+            retry_visible = state == StartupState.ERROR
+            retry_button.disabled = not retry_visible
+            retry_button.opacity = 1.0 if retry_visible else 0.0
+
+        prefix = "⏳"
+        detail = ""
+        base_connect = "Verbinde Tracker…"
+        if orchestrator is None:
+            prefix = "⏳"
+            detail = ""
+        elif state == StartupState.WAIT_SESSION:
+            detail = "Warte auf Session."
+        elif state == StartupState.ERROR:
+            prefix = "✗"
+            detail = "Verbindungsversuch fehlgeschlagen."
+        else:
+            if expected:
+                detail = f"Verbunden: {len(connected)}/{len(expected)}"
+            if (
+                state in (StartupState.STARTING, StartupState.READY, StartupState.RUNNING)
+                and expected
+                and expected.issubset(connected)
+            ):
+                prefix = "✓"
+                detail = "Alle Tracker verbunden."
+        if connect_label is not None:
+            suffix = f" {detail}" if detail else ""
+            connect_label.text = f"{prefix} {base_connect}{suffix}"
+
+        def _format_recording(label_widget: Any, player: str) -> None:
+            if label_widget is None:
+                return
+            base = f"Starte Aufnahme {player}…"
+            if expected and player not in expected:
+                label_widget.text = f"— Aufnahme {player} nicht konfiguriert."
+                return
+            if player in recordings:
+                label_widget.text = f"✓ Aufnahme {player} läuft."
+                return
+            if state == StartupState.ERROR:
+                label_widget.text = f"✗ Aufnahme {player} fehlgeschlagen."
+                return
+            prefix_local = "⏳"
+            detail_local = ""
+            if state in (StartupState.CONNECTING, StartupState.WAIT_SESSION):
+                if player in connected:
+                    detail_local = "Tracker verbunden, warte auf Start."
+                else:
+                    detail_local = "Warte auf Verbindung."
+            elif state == StartupState.STARTING:
+                if attempt and max_attempts:
+                    detail_local = f"Versuch {attempt}/{max_attempts}"
+            elif state in (StartupState.READY, StartupState.RUNNING):
+                detail_local = "Warte auf Aufnahme."
+            suffix_local = f" {detail_local}" if detail_local else ""
+            label_widget.text = f"{prefix_local} {base}{suffix_local}"
+
+        _format_recording(status_vp1, "VP1")
+        _format_recording(status_vp2, "VP2")
+        self._update_startup_play_button()
+
+    def update_startup_status_overlay(self) -> None:
+        self._update_startup_status_ui()
+
+    def on_startup_state_changed(self, _state: StartupState) -> None:
+        self._update_startup_status_ui()
+        try:
+            self.apply_phase()
+        except Exception:
+            log.debug("apply_phase during startup update failed", exc_info=True)
+
+    def handle_startup_ok(self) -> None:
+        session_text = self._startup_session_value
+        if not session_text:
+            self._set_startup_error("Bitte Session ID eingeben.")
+            return
+
+        block_spinner = self.wid_safe("startup_start_block_spinner")
+        try:
+            start_block_choice = int(block_spinner.text) if block_spinner is not None else self.start_block
+        except Exception:
+            start_block_choice = self.start_block
+        start_block_choice = self._clamp_start_block_choice(start_block_choice)
+
+        overlay_switch = self.wid_safe("startup_overlay_switch")
+        aruco_active = self.aruco_enabled
+        if overlay_switch is not None:
+            try:
+                aruco_active = bool(overlay_switch.active)
+            except Exception:
+                aruco_active = self.aruco_enabled
+
+        block_label = self._startup_block_value or None
+        self._set_startup_error("", manual=False)
+        self._finalize_session_setup(
+            session_text,
+            start_block_value=start_block_choice,
+            aruco_enabled=aruco_active,
+        )
+        self._trigger_startup_sequence(session_text, block_label)
+        self.update_intro_overlay()
+
+    def handle_startup_retry(self) -> None:
+        session_value = self._startup_session_value or (self.session_id or "")
+        if not session_value:
+            self._set_startup_error("Bitte Session ID eingeben.")
+            return
+        block_label = self._startup_block_value or self._startup_last_block_label
+        self._set_startup_error("", manual=False)
+        self._trigger_startup_sequence(session_value, block_label)
+
+    def handle_startup_play(self) -> None:
+        if not self._startup_can_play():
+            return
+        self.intro_active = False
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator is not None:
+            with suppress(Exception):
+                orchestrator.mark_running()
+        self.update_intro_overlay()
+        self.apply_phase()
+        self.update_user_displays()
 
     # --- Tracker host configuration ---------------------------------
     def _read_tracker_host_file(self) -> dict[str, str]:
@@ -1123,6 +1377,7 @@ class TabletopRoot(FloatLayout):
             intro_overlay.opacity = 1
             intro_overlay.disabled = False
             self.bring_start_buttons_to_front()
+            self._update_startup_status_ui()
         else:
             intro_overlay.opacity = 0
             intro_overlay.disabled = True
@@ -1318,10 +1573,12 @@ class TabletopRoot(FloatLayout):
         ready = phase_state.ready
         btn_start_p1 = self.wid_safe('btn_start_p1')
         btn_start_p2 = self.wid_safe('btn_start_p2')
+        allow_play = self._startup_can_play()
+        start_allowed = start_active and ready and allow_play
         if btn_start_p1 is not None:
-            btn_start_p1.set_live(start_active and ready)
+            btn_start_p1.set_live(start_allowed)
         if btn_start_p2 is not None:
-            btn_start_p2.set_live(start_active and ready)
+            btn_start_p2.set_live(start_allowed)
 
         if ready:
             for player, cards in phase_state.active_cards.items():
@@ -2044,86 +2301,46 @@ class TabletopRoot(FloatLayout):
             self.marker_bridge.enqueue(f"action.{action}", bridge_payload)
 
     def prompt_session_number(self):
-        if self.session_popup:
-            return
+        self.intro_active = True
+        self.update_intro_overlay()
 
-        content = BoxLayout(orientation='vertical', spacing=12, padding=12)
+        session_input = self.wid_safe("startup_session_input")
+        block_input = self.wid_safe("startup_block_input")
+        block_spinner = self.wid_safe("startup_start_block_spinner")
+        overlay_switch = self.wid_safe("startup_overlay_switch")
 
-        header = Label(text='Bitte Session ID eingeben:', size_hint_y=None, height='32dp')
-        session_input = TextInput(
-            hint_text='Session ID',
-            multiline=False,
-            size_hint_y=None,
-            height='40dp'
+        existing_session = self.session_id or self._startup_session_value
+        session_text = existing_session or ""
+        if session_input is not None:
+            session_input.text = session_text
+        self.on_startup_session_text(session_text)
+
+        block_text = (
+            self._startup_block_value
+            or self._startup_last_block_label
+            or (str(self._bridge_block) if self._bridge_block is not None else "")
         )
+        if block_input is not None:
+            block_input.text = block_text
+        self.on_startup_block_text(block_text)
 
-        row1 = BoxLayout(size_hint_y=None, height='40dp', spacing=8)
-        row1.add_widget(Label(text='Aruco-Overlay aktivieren'))
-        overlay_switch = Switch(active=self.aruco_enabled)
-        row1.add_widget(overlay_switch)
-
-        row2 = BoxLayout(size_hint_y=None, height='40dp', spacing=8)
-        row2.add_widget(Label(text='Startblock (1=Übung, 2–5=Experimental)'))
-        block_spinner = Spinner(
-            text=str(self.start_block),
-            values=[str(i) for i in range(1, 6)],
-            size_hint=(None, None),
-            size=('120dp', '40dp')
-        )
-        row2.add_widget(block_spinner)
-
-        error_label = Label(text='', color=(1, 0, 0, 1), size_hint_y=None, height='24dp')
-
-        buttons = BoxLayout(size_hint_y=None, height='44dp', spacing=8)
-        ok_button = Button(text='OK')
-        cancel_button = Button(text='Abbrechen')
-        buttons.add_widget(ok_button)
-        buttons.add_widget(cancel_button)
-
-        content.add_widget(header)
-        content.add_widget(session_input)
-        content.add_widget(row1)
-        content.add_widget(row2)
-        content.add_widget(error_label)
-        content.add_widget(buttons)
-
-        popup = Popup(
-            title='Session starten',
-            content=content,
-            size_hint=(0.6, 0.6),
-            auto_dismiss=False
-        )
-        self.session_popup = popup
-
-        def _on_ok(_btn):
-            session_text = session_input.text.strip()
-            if not session_text:
-                error_label.text = 'Bitte Session ID eingeben.'
-                return
-
+        if block_spinner is not None:
             try:
-                start_block_choice = int(block_spinner.text)
+                block_spinner.text = str(self.start_block)
             except Exception:
-                start_block_choice = 1
-            start_block_choice = self._clamp_start_block_choice(start_block_choice)
-            aruco_active = bool(overlay_switch.active)
+                block_spinner.text = "1"
 
-            popup.dismiss()
-            self.session_popup = None
+        if overlay_switch is not None:
+            try:
+                overlay_switch.active = bool(self.aruco_enabled)
+            except Exception:
+                overlay_switch.active = False
 
-            self._finalize_session_setup(
-                session_text,
-                start_block_value=start_block_choice,
-                aruco_enabled=aruco_active,
-            )
+        self._set_startup_error("", manual=False)
+        self._update_startup_status_ui()
 
-        def _on_cancel(_btn):
-            popup.dismiss()
-            self.session_popup = None
-
-        ok_button.bind(on_release=_on_ok)
-        cancel_button.bind(on_release=_on_cancel)
-        popup.open()
+        if session_input is not None:
+            Clock.schedule_once(lambda *_: setattr(session_input, "focus", True), 0.05)
 
     def _start_overlay_with_path(self, process: Optional[Any]) -> Optional[Any]:
         """Start the ArUco overlay process with the relocated script path."""
