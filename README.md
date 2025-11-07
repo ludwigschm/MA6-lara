@@ -81,3 +81,35 @@ Konfidenz und Queue-Last direkt in der Konsole und erzeugt eine Demo-Datenbank
 Falls ein angeschlossenes Gerät keine nachträglichen Änderungen an bestehenden
 Annotationen zulässt (z. B. Neon ohne Retro-Edit), werden Refinements trotzdem
 hostseitig gespiegelt und im Laufordner (`runs/`) protokolliert.
+
+## Manuelle Prüfschritte
+
+Die folgenden Tests dokumentieren den erwarteten Systemzustand in häufigen
+Szenarien. Sie lassen sich ohne zusätzliche Tools durchführen und dienen der
+Reproduzierbarkeit:
+
+1. **Start ohne Session**
+   - Anwendung starten, ohne eine Session zu wählen.
+   - Erwartung: Es werden keine Verbindungsversuche zu Trackern unternommen.
+
+2. **Session mit einem offline Tracker**
+   - Session setzen und einen Tracker bewusst offline lassen.
+   - Erwarteter Ablauf: Status „CONNECTING“, anschließend Timeout und Status
+     „ERROR“.
+
+3. **Beide Tracker online**
+   - Beide Tracker einschalten und Session setzen.
+   - Erwarteter Ablauf: Status „STARTING“, anschließend laufen beide Tracker,
+     Status wechselt auf „READY“, die Schaltfläche „Play“ ist aktiv.
+
+4. **Tracker benötigt zwei Verbindungsversuche**
+   - Einen Tracker so konfigurieren, dass der erste Versuch scheitert, der
+     zweite jedoch klappt.
+   - Erwartung: Im Log sind die Wiederholungsversuche inklusive Verzögerung
+     („Retry“ + Delay) sichtbar.
+
+5. **Kurzzeitiger Verbindungsabbruch während laufender Session**
+   - Spiel starten, einen Tracker kurzzeitig unterbrechen und wieder herstellen.
+   - Erwartung: Der Tracker stellt im Hintergrund still wieder eine Verbindung
+     her, ohne Fehlermeldung; nach erfolgreichem Reconnect läuft das Spiel
+     weiter.
