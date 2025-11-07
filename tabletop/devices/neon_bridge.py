@@ -337,6 +337,9 @@ class PupilBridge:
         self._recording_states.pop(player, None)
         self._recording_labels.pop(player, None)
 
+    def is_recording(self, player: str) -> bool:
+        return self._is_recording(player)
+
     # ------------------------------------------------------------------
     # Event helpers
     def send_event(

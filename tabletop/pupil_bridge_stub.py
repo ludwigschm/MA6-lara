@@ -26,6 +26,7 @@ class PupilBridge:
     _connected: Dict[str, bool] = field(default_factory=dict)
     _hosts: Dict[str, str] = field(default_factory=dict)
     _mirror: Dict[str, Dict[str, Dict[str, object]]] = field(default_factory=dict)
+    _recording: Dict[str, bool] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Connection handling
@@ -62,10 +63,15 @@ class PupilBridge:
         return None
 
     def start_recording(self, session: int, block: int, player: str) -> None:
+        self._recording[str(player)] = True
         return None
 
     def stop_recording(self, player: str) -> None:
+        self._recording[str(player)] = False
         return None
+
+    def is_recording(self, player: str) -> bool:
+        return bool(self._recording.get(str(player), False))
 
     # ------------------------------------------------------------------
     # Event helpers
