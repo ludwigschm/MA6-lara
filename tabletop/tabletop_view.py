@@ -350,7 +350,8 @@ class TabletopRoot(FloatLayout):
             orchestrator.attach(self, bridge)  # type: ignore[arg-type]
 
         self._mark_bridge_dirty()
-        self._ensure_bridge_recordings()
+        if self._can_attempt_bridge_recordings():
+            self._ensure_bridge_recordings()
         self._ensure_time_reconciler()
         self._update_startup_status_ui()
         if self.session_configured:
@@ -394,6 +395,15 @@ class TabletopRoot(FloatLayout):
 
     def _mark_bridge_dirty(self) -> None:
         self._bridge_state_dirty = True
+
+    def _can_attempt_bridge_recordings(self) -> bool:
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator is None:
+            return True
+        try:
+            return bool(orchestrator.should_attempt_recordings())
+        except Exception:
+            return False
 
     def _ensure_bridge_recordings(self, *_: Any, force: bool = False) -> None:
         try:
@@ -777,7 +787,8 @@ class TabletopRoot(FloatLayout):
             },
         )
         self._mark_bridge_dirty()
-        self._ensure_bridge_recordings()
+        if self._can_attempt_bridge_recordings():
+            self._ensure_bridge_recordings()
         self._apply_session_options_and_start()
 
     def _configure_session_from_cli(self, *_args: Any) -> None:
@@ -984,8 +995,12 @@ class TabletopRoot(FloatLayout):
     def update_startup_status_overlay(self) -> None:
         self._update_startup_status_ui()
 
-    def on_startup_state_changed(self, _state: StartupState) -> None:
+    def on_startup_state_changed(self, state: StartupState) -> None:
         self._update_startup_status_ui()
+        if state in (StartupState.STARTING, StartupState.READY, StartupState.RUNNING):
+            self._mark_bridge_dirty()
+            if self._can_attempt_bridge_recordings():
+                self._ensure_bridge_recordings(force=True)
         try:
             self.apply_phase()
         except Exception:
@@ -1032,10 +1047,21 @@ class TabletopRoot(FloatLayout):
         self._trigger_startup_sequence(session_value, block_label)
 
     def handle_startup_play(self) -> None:
+        self.on_play_clicked()
+
+    def on_play_clicked(self) -> None:
+        orchestrator = getattr(self, "startup_orchestrator", None)
+        if orchestrator is not None:
+            try:
+                ready = orchestrator.is_ready()
+            except Exception:
+                ready = False
+            if not ready:
+                self._set_startup_error("Bitte warten: EyeTracker noch nicht bereit.")
+                return
         if not self._startup_can_play():
             return
         self.intro_active = False
-        orchestrator = getattr(self, "startup_orchestrator", None)
         if orchestrator is not None:
             with suppress(Exception):
                 orchestrator.mark_running()
@@ -1143,7 +1169,8 @@ class TabletopRoot(FloatLayout):
                 orchestrator.attach(self, bridge)
                 orchestrator.begin_connect()
         self._mark_bridge_dirty()
-        self._ensure_bridge_recordings(force=True)
+        if self._can_attempt_bridge_recordings():
+            self._ensure_bridge_recordings(force=True)
 
     def open_tracker_settings_dialog(self) -> None:
         existing = self._read_tracker_host_file()
@@ -1874,7 +1901,8 @@ class TabletopRoot(FloatLayout):
         self.refresh_center_cards(reveal=False)
         self.update_user_displays()
         self._mark_bridge_dirty()
-        self._ensure_bridge_recordings()
+        if self._can_attempt_bridge_recordings():
+            self._ensure_bridge_recordings()
 
     def refresh_center_cards(self, reveal: bool):
         if reveal:
