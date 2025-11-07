@@ -43,6 +43,8 @@ class StartupOrchestrator:
         self._connect_event = None
         self._start_event = None
         self._start_retry_event = None
+        self._error_message = ""
+        self._current_start_attempt = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -55,6 +57,7 @@ class StartupOrchestrator:
         if self._state == StartupState.INIT:
             self._transition(StartupState.WAIT_SESSION)
         log.debug("StartupOrchestrator attached (bridge=%s)", type(bridge).__name__)
+        self._notify_status_update()
 
     def set_session(self, session_id: str, block_id: Optional[str] = None) -> None:
         self._session_id = session_id
@@ -62,6 +65,7 @@ class StartupOrchestrator:
         self._cancel_connect_poll()
         self._cancel_start_poll()
         self._cancel_start_retry()
+        self._error_message = ""
         if self._state != StartupState.WAIT_SESSION:
             self._transition(StartupState.WAIT_SESSION)
         log.info(
@@ -69,6 +73,7 @@ class StartupOrchestrator:
             session_id,
             block_id,
         )
+        self._notify_status_update()
 
     def begin_connect(self) -> None:
         if not self._session_id:
@@ -85,6 +90,8 @@ class StartupOrchestrator:
         self._cancel_connect_poll()
         self._cancel_start_poll()
         self._cancel_start_retry()
+        self._error_message = ""
+        self._current_start_attempt = 0
         self._transition(StartupState.CONNECTING)
         self._connect_deadline = time.monotonic() + self.CONNECT_TIMEOUT_S
         log.info(
@@ -98,6 +105,7 @@ class StartupOrchestrator:
         except Exception:  # pragma: no cover - defensive logging
             log.exception("StartupOrchestrator: bridge.connect() fehlgeschlagen")
         self._schedule_connect_poll(delay=0.0)
+        self._notify_status_update()
 
     def begin_start_recordings(self) -> None:
         if self._state not in (StartupState.CONNECTING, StartupState.STARTING):
@@ -112,10 +120,20 @@ class StartupOrchestrator:
 
         self._transition(StartupState.STARTING)
         self._start_retries_left = self.START_RETRIES
+        self._current_start_attempt = 0
         self._start_next_attempt()
 
     def is_ready(self) -> bool:
         return self._state == StartupState.READY
+
+    def current_state(self) -> StartupState:
+        return self._state
+
+    def error_message(self) -> str:
+        return self._error_message
+
+    def current_start_attempt(self) -> int:
+        return self._current_start_attempt
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -139,6 +157,30 @@ class StartupOrchestrator:
             new_state.name,
         )
         self._state = new_state
+        if new_state != StartupState.STARTING:
+            self._current_start_attempt = 0
+        if new_state != StartupState.ERROR:
+            self._error_message = ""
+        self._notify_state_changed()
+        self._notify_status_update()
+
+    def _notify_state_changed(self) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.on_startup_state_changed(self._state)
+        except Exception:
+            log.debug("StartupOrchestrator: state callback failed", exc_info=True)
+
+    def _notify_status_update(self) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.update_startup_status_overlay()
+        except Exception:
+            log.debug("StartupOrchestrator: status callback failed", exc_info=True)
 
     def _schedule_connect_poll(self, *, delay: float) -> None:
         self._cancel_connect_poll()
@@ -159,6 +201,7 @@ class StartupOrchestrator:
         now = time.monotonic()
         connected = self._connected_players()
         expected = self._expected_players()
+        self._notify_status_update()
         if expected and expected.issubset(connected):
             log.info(
                 "StartupOrchestrator: Alle Tracker verbunden (%s)",
@@ -168,6 +211,7 @@ class StartupOrchestrator:
             return
         if now >= self._connect_deadline:
             log.error("StartupOrchestrator: Verbindungsaufbau abgelaufen")
+            self._error_message = "Verbindungsaufbau abgelaufen."
             self._transition(StartupState.ERROR)
             return
         log.debug(
@@ -182,11 +226,13 @@ class StartupOrchestrator:
             return
         if self._start_retries_left <= 0:
             log.error("StartupOrchestrator: Recording-Start fehlgeschlagen")
+            self._error_message = "Aufnahmen konnten nicht gestartet werden."
             self._transition(StartupState.ERROR)
             return
 
         self._start_retries_left -= 1
         attempt_number = self.START_RETRIES - self._start_retries_left
+        self._current_start_attempt = attempt_number
         log.info(
             "StartupOrchestrator: Starte Aufnahmen (Versuch %d/%d)",
             attempt_number,
@@ -199,6 +245,7 @@ class StartupOrchestrator:
         self._start_deadline = time.monotonic() + self.START_TIMEOUT_S
         self._schedule_start_poll(delay=max(self.RETRY_DELAY_S, 0.2))
         self._cancel_start_retry()
+        self._notify_status_update()
 
     def _schedule_start_poll(self, *, delay: float) -> None:
         self._cancel_start_poll()
@@ -217,6 +264,7 @@ class StartupOrchestrator:
         if self._state != StartupState.STARTING:
             return
         now = time.monotonic()
+        self._notify_status_update()
         if self._recordings_active():
             log.info("StartupOrchestrator: Alle Aufnahmen laufen.")
             self._transition(StartupState.READY)
@@ -233,12 +281,14 @@ class StartupOrchestrator:
             return
         if self._start_retries_left <= 0:
             log.error("StartupOrchestrator: Aufnahmen konnten nicht gestartet werden")
+            self._error_message = "Aufnahmen konnten nicht gestartet werden."
             self._transition(StartupState.ERROR)
             return
         self._cancel_start_retry()
         self._start_retry_event = Clock.schedule_once(
             self._execute_start_retry, self.RETRY_DELAY_S
         )
+        self._notify_status_update()
 
     def _execute_start_retry(self, _dt: float) -> None:
         self._start_next_attempt()
