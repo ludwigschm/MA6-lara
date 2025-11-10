@@ -59,6 +59,8 @@ pip install kivy pandas numpy opencv-contrib-python sounddevice
    bleiben.
 3. Session und Block im Startdialog setzen. In der Konsole erscheinen pro
    Tracker die Meldungen `status ok` und – nach dem Startbefehl – `streaming ok`.
+   Die HTTP-Endpunkte, die der Bridge zum automatischen Start nutzt, sind in
+   [`docs/neon_tracker_api.md`](docs/neon_tracker_api.md) dokumentiert.
 4. Über den Play-Button den Start auslösen. Beobachten, dass VP1 sofort startet
    und VP2 exakt 2 s später folgt (Log-Ausgaben "Starte Aufnahme VP1/VP2").
 5. Eine Marker-Aktion im UI auslösen (z. B. Demo-Events). Es erscheint einmalig

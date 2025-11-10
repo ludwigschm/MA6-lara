@@ -18,8 +18,9 @@ def neon_bridge_module(monkeypatch):
     fake_api = types.ModuleType("pupil_labs.realtime_api")
 
     class _StubDevice:
-        def __init__(self, host: str) -> None:
+        def __init__(self, host: str, port: int | None = None) -> None:
             self.host = host
+            self.port = port
             self.annotations = types.SimpleNamespace()
 
     fake_api.Device = _StubDevice
@@ -50,15 +51,17 @@ class _RecordingAnnotations:
 
 
 def _install_device(bridge, player: str, annotations) -> None:
-    device = types.SimpleNamespace(annotations=annotations, name=f"device-{player}")
-    bridge._devices[player] = device
-    bridge._connected.add(player)
+    canonical = bridge._canonicalize_player(player)
+    device = types.SimpleNamespace(annotations=annotations, name=f"device-{canonical}")
+    bridge._devices[canonical] = device
+    bridge._connected.add(canonical)
 
 
 def _install_clock_device(bridge, player: str, clock) -> None:
-    device = types.SimpleNamespace(clock=clock, name=f"device-{player}")
-    bridge._devices[player] = device
-    bridge._connected.add(player)
+    canonical = bridge._canonicalize_player(player)
+    device = types.SimpleNamespace(clock=clock, name=f"device-{canonical}")
+    bridge._devices[canonical] = device
+    bridge._connected.add(canonical)
 
 
 def test_send_event_emits_marker(neon_bridge):
@@ -137,13 +140,14 @@ def test_estimate_time_offset_prefers_roundtrip_result(neon_bridge, caplog):
 
     assert offset == pytest.approx(0.0015)
     assert clock.calls == [{"sample_count": 8}]
-    assert any("Zeitoffset für p1" in record.getMessage() for record in caplog.records)
+    assert any("Zeitoffset für VP1" in record.getMessage() for record in caplog.records)
 
 
 def test_estimate_time_offset_handles_missing_clock(neon_bridge, caplog):
     bridge = neon_bridge
-    bridge._devices["p2"] = types.SimpleNamespace(name="device-p2")
-    bridge._connected.add("p2")
+    canonical = bridge._canonicalize_player("p2")
+    bridge._devices[canonical] = types.SimpleNamespace(name=f"device-{canonical}")
+    bridge._connected.add(canonical)
 
     caplog.set_level("WARNING")
     assert bridge.estimate_time_offset("p2") is None
@@ -160,3 +164,28 @@ def test_estimate_time_offset_logs_measurement_failure(neon_bridge, caplog):
     caplog.set_level("WARNING")
     assert neon_bridge.estimate_time_offset("p3") is None
     assert any("Roundtrip-Zeitmessung" in record.getMessage() for record in caplog.records)
+
+
+def test_connect_starts_http_stream(monkeypatch, neon_bridge_module):
+    started: list[str] = []
+
+    def _fake_start(client, *, start_timeout, logger):
+        started.append(client.base_url)
+        return True
+
+    monkeypatch.setattr(neon_bridge_module, "ensure_tracker_running", _fake_start)
+    monkeypatch.setattr(neon_bridge_module.PupilBridge, "_start_tracker_monitor", lambda self: None)
+    monkeypatch.setattr(
+        neon_bridge_module.PupilBridge,
+        "_probe_endpoint",
+        lambda self, player, host, hostname, port: True,
+    )
+
+    bridge = neon_bridge_module.PupilBridge()
+    try:
+        bridge.configure_hosts({"VP1": "10.0.0.2:8080"})
+        bridge.connect()
+        assert started == ["http://10.0.0.2:8080"]
+        assert "VP1" in bridge._tracker_last_seen
+    finally:
+        bridge.close()
