@@ -26,9 +26,12 @@ pip install kivy pandas numpy opencv-contrib-python sounddevice
    Beispielinhalt für `tracker_hosts.txt`:
 
    ```
-   192.168.0.20
-   192.168.0.21
+   VP1=192.168.137.253:8080
+   VP2=192.168.137.90:8080
    ```
+
+   Alternativ lassen sich die Hosts auch über Umgebungsvariablen setzen:
+   `NEON_VP1_HOST` und `NEON_VP2_HOST`.
 
 3. Anwendung starten:
 
