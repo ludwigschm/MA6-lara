@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import itertools
 import json
 import logging
+import os
 import queue
 import socket
 import threading
@@ -17,7 +19,7 @@ from urllib.parse import urlparse
 
 import pupil_labs.realtime_api as plrt
 
-from .tracker_client import TrackerClient, ensure_tracker_running
+from .tracker_client import HttpTracker, ensure_tracker_running
 
 
 class PupilBridge:
@@ -47,13 +49,20 @@ class PupilBridge:
         self._host_mirror: dict[str, dict[str, dict[str, Any]]] = {}
         self._host_log_lock = threading.Lock()
         self._host_log_path = Path.cwd() / "runs" / "neon_host_mirror.jsonl"
-        self._tracker_clients: dict[str, TrackerClient] = {}
+        self._tracker_clients: dict[str, HttpTracker] = {}
         self._tracker_last_seen: dict[str, float] = {}
         self._tracker_warning_gate: dict[str, float] = {}
         self._tracker_monitor: threading.Thread | None = None
         self._tracker_monitor_stop = threading.Event()
         self._tracker_start_timeout = float(tracker_start_timeout_s)
         self._marker_disabled_players: set[str] = set()
+        self._marker_warning_emitted = False
+        marker_env = os.environ.get("TABLETOP_ENABLE_MARKERS")
+        if marker_env is None:
+            self._markers_enabled = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        else:
+            self._markers_enabled = marker_env.strip().lower() in {"1", "true", "yes", "on"}
+        self._marker_notice_logged = False
         self._logger.info("Neon PupilBridge initialisiert – bereit für Verbindungen.")
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -105,7 +114,8 @@ class PupilBridge:
             )
 
         if self._connected:
-            self._start_worker()
+            if self._markers_enabled:
+                self._start_worker()
             self._start_tracker_monitor()
         else:
             self._logger.warning(
@@ -142,7 +152,7 @@ class PupilBridge:
             close = getattr(device, "close", None)
             if callable(close):
                 try:
-                    close()
+                    self._call_in_loop(close)
                 except Exception as exc:  # pragma: no cover - external API dependent
                     self._logger.warning(
                         "Schließen des Neon-Trackers %s fehlgeschlagen: %s",
@@ -173,7 +183,7 @@ class PupilBridge:
             if not host:
                 continue
             hostname, port = self._resolve_endpoint(host)
-            self._tracker_clients[player] = TrackerClient(hostname, port)
+            self._tracker_clients[player] = HttpTracker(hostname, port)
         if self._tracker_clients:
             self._start_tracker_monitor()
         else:
@@ -256,11 +266,11 @@ class PupilBridge:
         if player in self._marker_disabled_players:
             return
         self._marker_disabled_players.add(player)
-        self._throttled_log(
-            "Marker-Interface nicht verfügbar – verwende HTTP-Start.",
-            key=f"marker:{player}",
-            level=logging.WARNING,
-        )
+        if not self._marker_warning_emitted:
+            self._logger.warning(
+                "Marker-Interface nicht verfügbar – verwende HTTP-Start."
+            )
+            self._marker_warning_emitted = True
 
     shutdown = close  # Backwards compatibility alias
 
@@ -372,9 +382,9 @@ class PupilBridge:
         for attempt in range(1, max_attempts + 1):
             try:
                 try:
-                    start_callable(label=label)
+                    self._call_in_loop(start_callable, label=label)
                 except TypeError:
-                    start_callable(label)
+                    self._call_in_loop(start_callable, label)
                 self._logger.info(
                     "Starte Neon-Aufnahme für Spieler %s (Label %s, Versuch %d/%d).",
                     player,
@@ -450,13 +460,13 @@ class PupilBridge:
             label = self._recording_labels.get(player)
             if label is not None:
                 try:
-                    stop_callable(label=label)
+                    self._call_in_loop(stop_callable, label=label)
                 except TypeError:
-                    stop_callable(label)
+                    self._call_in_loop(stop_callable, label)
                 except Exception:
-                    stop_callable()
+                    self._call_in_loop(stop_callable)
             else:
-                stop_callable()
+                self._call_in_loop(stop_callable)
             self._logger.info("Stoppe Neon-Aufnahme für Spieler %s.", player)
         except Exception as exc:  # pragma: no cover - depends on external API
             self._logger.error(
@@ -488,6 +498,13 @@ class PupilBridge:
         *,
         priority: str | None = None,
     ) -> None:
+        if not self._markers_enabled:
+            if not self._marker_notice_logged:
+                self._logger.warning(
+                    "Marker-Pfad deaktiviert – Marker-Ereignisse werden nicht gesendet."
+                )
+                self._marker_notice_logged = True
+            return
         if player not in self._connected:
             self._logger.warning(
                 "Event %s ignoriert – Spieler %s nicht verbunden.",
@@ -1161,11 +1178,37 @@ class PupilBridge:
             try:
                 res = fn(*args, **kwargs)
             except Exception as e:  # pragma: no cover - relies on external API
-                fut.set_exception(e)
-            else:
-                fut.set_result(res)
+                if not fut.done():
+                    fut.set_exception(e)
+                return
 
-        self._loop.call_soon_threadsafe(_runner)
+            if inspect.isawaitable(res):
+                try:
+                    task = asyncio.ensure_future(res)
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    if not fut.done():
+                        fut.set_exception(exc)
+                    return
+
+                def _task_done(completed: asyncio.Future) -> None:
+                    if fut.done():
+                        return
+                    try:
+                        result = completed.result()
+                    except Exception as task_exc:  # pragma: no cover - external API
+                        fut.set_exception(task_exc)
+                    else:
+                        fut.set_result(result)
+
+                task.add_done_callback(_task_done)
+            else:
+                if not fut.done():
+                    fut.set_result(res)
+
+        try:
+            self._loop.call_soon_threadsafe(_runner)
+        except RuntimeError as exc:  # pragma: no cover - loop may already be closed
+            fut.set_exception(exc)
         return fut.result()
 
 
