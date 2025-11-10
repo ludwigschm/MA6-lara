@@ -163,10 +163,12 @@ class MarkerOverlay(QMainWindow):
             Qt.WindowType.Tool
         )
         self.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # Mausereignisse komplett durchreichen – verhindert, dass das Overlay Eingaben blockiert
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(BG_WHITE_CSS)
         self.setGeometry(screen_geometry)

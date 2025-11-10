@@ -43,6 +43,22 @@ pip install kivy pandas numpy opencv-contrib-python sounddevice
    `trial.start` erscheinen. Die Events werden mit der Gerätezeit gestempelt,
    Host-Zeitstempel müssen nicht übermittelt werden.
 
+## Testanleitung
+
+1. Zwei Tracker-Instanzen (oder Mocks) mit HTTP-Endpunkten `/api/status` und
+   `/api/start_stream` bereitstellen, die im Statusfeld `state`, `mode`, `frame`
+   oder `fps` zurückgeben.
+2. Anwendung mit `python bluffing_eyes.py` starten, das Tracker-Dialogfenster
+   öffnen und sicherstellen, dass die Eingabefelder jederzeit fokussierbar
+   bleiben.
+3. Session und Block im Startdialog setzen. In der Konsole erscheinen pro
+   Tracker die Meldungen `status ok` und – nach dem Startbefehl – `streaming ok`.
+4. Über den Play-Button den Start auslösen. Beobachten, dass VP1 sofort startet
+   und VP2 exakt 2 s später folgt (Log-Ausgaben "Starte Aufnahme VP1/VP2").
+5. Eine Marker-Aktion im UI auslösen (z. B. Demo-Events). Es erscheint einmalig
+   der Hinweis "Marker-Pfad deaktiviert", weitere Marker-Warnungen bleiben
+   aus; Eingaben im UI werden dabei nicht blockiert.
+
 ## Event-Zeitmodell & Refinement
 
 Die Tabletop-App vergibt jetzt für jedes UI-Ereignis sofort eine eindeutige

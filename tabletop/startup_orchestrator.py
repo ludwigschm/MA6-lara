@@ -362,6 +362,16 @@ class StartupOrchestrator:
                 log.debug("StartupOrchestrator: Cancel start sequence failed", exc_info=True)
         self._start_sequence_event = None
 
+    def _schedule_sequence_resume(self, *, delay: float) -> None:
+        self._cancel_start_sequence_event()
+        self._start_sequence_event = Clock.schedule_once(
+            self._resume_start_sequence, delay
+        )
+
+    def _resume_start_sequence(self, _dt: float) -> None:
+        self._start_sequence_event = None
+        self._advance_start_sequence()
+
     def _poll_start_status(self, _dt: float) -> None:
         self._start_event = None
         if self._state != StartupState.STARTING:
@@ -556,7 +566,14 @@ class StartupOrchestrator:
         self._cancel_start_poll()
         self._cancel_start_retry()
         self._notify_status_update()
-        self._advance_start_sequence()
+        players = self._start_sequence_players or ["VP1", "VP2"]
+        next_player: Optional[str] = None
+        if self._start_sequence_index < len(players):
+            next_player = players[self._start_sequence_index]
+        if player.upper() == "VP1" and next_player == "VP2":
+            self._schedule_sequence_resume(delay=2.0)
+        else:
+            self._advance_start_sequence()
 
     def _finish_start_sequence(self) -> None:
         expected = self._expected_players()
