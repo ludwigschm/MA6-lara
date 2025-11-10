@@ -133,6 +133,7 @@ class PupilBridge:
             self._logger.info(
                 "Neon-Tracker %s verbunden (Host %s:%s).", player, hostname, port
             )
+            self._handle_tracker_connected(player, hostname, port)
 
         if self._connected:
             if self._markers_enabled:
@@ -209,6 +210,25 @@ class PupilBridge:
             self._start_tracker_monitor()
         else:
             self._stop_tracker_monitor()
+
+    def _handle_tracker_connected(self, player: str, hostname: str, port: int) -> None:
+        """Ensure an HTTP client exists and start streaming immediately."""
+
+        player = self._canonicalize_player(player)
+        client = self._tracker_clients.get(player)
+        if client is None:
+            client = HttpTracker(hostname, port)
+            self._tracker_clients[player] = client
+            if self._tracker_clients:
+                self._start_tracker_monitor()
+        ready = self._ensure_tracker_ready(player)
+        if ready:
+            self._tracker_last_seen[player] = time.monotonic()
+            return
+        self._logger.warning(
+            "Tracker %s konnte nicht automatisch in den Streaming-Zustand versetzt werden.",
+            player,
+        )
 
     def _start_tracker_monitor(self) -> None:
         if self._tracker_monitor and self._tracker_monitor.is_alive():
