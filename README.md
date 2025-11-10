@@ -1,10 +1,13 @@
-Folgende Pakete müssen installiert werden: 
+Folgende Pakete müssen installiert werden:
 
-kivy	
+kivy
 pandas
-numpy	
+numpy
 opencv-contrib-python
 sounddevice
+
+
+> Hinweis: Window placement is now clamped; session defaults; orchestrator idempotent; KV class duplication removed.
 
 
 pip install kivy pandas numpy opencv-contrib-python sounddevice

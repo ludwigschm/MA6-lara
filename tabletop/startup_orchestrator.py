@@ -69,6 +69,11 @@ class StartupOrchestrator:
     # ------------------------------------------------------------------
     # Public API
     def attach(self, root: "TabletopRoot", bridge: "PupilBridge") -> None:
+        if self._root is root and self._bridge is bridge:
+            # Idempotent guard prevents duplicate attachment work/log spam.
+            log.debug("StartupOrchestrator attach skipped (already attached)")
+            return
+
         self._root = root
         self._bridge = bridge
         self._cancel_connect_poll()
@@ -103,6 +108,7 @@ class StartupOrchestrator:
             )
             return
         if not self._session_id:
+            # Robust startup: bail out cleanly when no session id is configured yet.
             log.info(
                 "StartupOrchestrator: Verbindung nicht gestartet – Session fehlt."
             )
