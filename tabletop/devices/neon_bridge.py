@@ -70,10 +70,31 @@ class PupilBridge:
         )
         self._loop_thread.start()
 
+    def _canonicalize_player(self, player: str) -> str:
+        """
+        Normalisiert Spielerbezeichnungen auf "VP1" bzw. "VP2".
+
+        Akzeptierte Aliasse (case-insensitive, Whitespaces werden getrimmt):
+          - "A", "1", "P1", "PLAYER1", "VP1" -> "VP1"
+          - "B", "2", "P2", "PLAYER2", "VP2" -> "VP2"
+        """
+        key = (player or "").strip().lower()
+        if key in {"vp1", "a", "1", "p1", "player1"}:
+            return "VP1"
+        if key in {"vp2", "b", "2", "p2", "player2"}:
+            return "VP2"
+        if key.upper() in {"VP1", "VP2"}:
+            return key.upper()
+        return player
+
     # ------------------------------------------------------------------
     # Connection handling
     def configure_hosts(self, hosts: dict[str, str]) -> None:
-        self._hosts = {str(key): str(value) for key, value in hosts.items()}
+        normalized: dict[str, str] = {}
+        for key, value in hosts.items():
+            canonical = self._canonicalize_player(str(key))
+            normalized[canonical] = str(value)
+        self._hosts = normalized
         if self._hosts:
             formatted = ", ".join(f"{key}={value}" for key, value in sorted(self._hosts.items()))
             self._logger.info("Tracker-Hosts konfiguriert: %s", formatted)
@@ -263,6 +284,7 @@ class PupilBridge:
         return "keine marker" in message or "marker-schnittstelle" in message
 
     def _disable_marker_for(self, player: str) -> None:
+        player = self._canonicalize_player(player)
         if player in self._marker_disabled_players:
             return
         self._marker_disabled_players.add(player)
@@ -282,6 +304,17 @@ class PupilBridge:
         return players
 
     def is_connected(self, player: str) -> bool:
+        original = player
+        player = self._canonicalize_player(player)
+        if player not in {"VP1", "VP2"}:
+            alias = (original or "").strip()
+            alias_key = alias.lower()
+            if alias and alias.upper() not in {"VP1", "VP2"}:
+                self._throttled_log(
+                    f"Unbekannter Spieler-Alias '{alias}' – bitte VP1/VP2 verwenden.",
+                    key=f"player-alias:{alias_key}",
+                    level=logging.WARNING,
+                )
         result = player in self._connected
         self._logger.debug("is_connected(%s) -> %s", player, result)
         return result
@@ -306,17 +339,30 @@ class PupilBridge:
         if players is None:
             active_players: Tuple[str, ...] = tuple(self.connected_players())
         else:
-            active_players = tuple(str(player) for player in players if player)
+            canonical_players = []
+            for player in players:
+                if not player:
+                    continue
+                canonical = self._canonicalize_player(str(player))
+                canonical_players.append(canonical)
+            active_players = tuple(dict.fromkeys(canonical_players))
 
         if not active_players:
             self._logger.debug("ensure_recordings() – keine aktiven Spieler gefunden.")
             return
 
-        for player in active_players:
-            if not self._is_recording(player):
+        attempts = 2
+        for attempt in range(attempts):
+            missing = [player for player in active_players if not self._is_recording(player)]
+            if not missing:
+                return
+            for player in missing:
                 self.start_recording(session, block, player)
+            if attempt < attempts - 1:
+                time.sleep(0.35)
 
     def _ensure_tracker_ready(self, player: str) -> bool:
+        player = self._canonicalize_player(player)
         client = self._tracker_clients.get(player)
         if client is None:
             return True
@@ -336,6 +382,7 @@ class PupilBridge:
         return False
 
     def start_recording(self, session: int, block: int, player: str) -> None:
+        player = self._canonicalize_player(player)
         device = self._devices.get(player)
         if device is None:
             self._logger.warning(
@@ -417,9 +464,10 @@ class PupilBridge:
         )
 
     def stop_recording(self, player: str) -> None:
+        player = self._canonicalize_player(player)
         device = self._devices.get(player)
         if device is None:
-            self._logger.warning(
+            self._logger.info(
                 "Stoppen der Aufnahme für Spieler %s übersprungen – kein verbundenes Gerät.",
                 player,
             )
@@ -486,6 +534,7 @@ class PupilBridge:
         self._recording_labels.pop(player, None)
 
     def is_recording(self, player: str) -> bool:
+        player = self._canonicalize_player(player)
         return self._is_recording(player)
 
     # ------------------------------------------------------------------
@@ -498,6 +547,7 @@ class PupilBridge:
         *,
         priority: str | None = None,
     ) -> None:
+        player = self._canonicalize_player(player)
         if not self._markers_enabled:
             if not self._marker_notice_logged:
                 self._logger.warning(
@@ -585,6 +635,7 @@ class PupilBridge:
         t_ref_ns: int,
         extra: Optional[Dict[str, object]] = None,
     ) -> None:
+        player = self._canonicalize_player(player)
         entry = self._store_host_mirror(
             player,
             event_id,
@@ -609,6 +660,7 @@ class PupilBridge:
         mapping_version: int,
         extra: Optional[Dict[str, object]] = None,
     ) -> None:
+        player = self._canonicalize_player(player)
         mirror_entry = self._store_host_refinement(
             player,
             event_id,
@@ -681,6 +733,7 @@ class PupilBridge:
         return load, max_size
 
     def estimate_time_offset(self, player: str) -> Optional[float]:
+        player = self._canonicalize_player(player)
         device = self._devices.get(player)
         if device is None:
             self._logger.warning(
@@ -821,6 +874,7 @@ class PupilBridge:
     # ------------------------------------------------------------------
     # Internal helpers
     def _is_recording(self, player: str, *, device: plrt.Device | None = None) -> bool:
+        player = self._canonicalize_player(player)
         if device is None:
             device = self._devices.get(player)
         if device is None:
@@ -846,6 +900,7 @@ class PupilBridge:
         timeout: float = 4.0,
         poll_interval: float = 0.2,
     ) -> bool:
+        player = self._canonicalize_player(player)
         deadline = time.monotonic() + max(0.0, timeout)
         while time.monotonic() < deadline:
             if self._is_recording(player, device=device) == expected:
@@ -911,7 +966,7 @@ class PupilBridge:
                 if not isinstance(item, dict):
                     continue
 
-                player = str(item.get("player"))
+                player = self._canonicalize_player(str(item.get("player")))
                 name = str(item.get("name"))
                 payload = item.get("payload")
                 device = self._devices.get(player)
@@ -1064,6 +1119,7 @@ class PupilBridge:
         *,
         extra: Optional[Dict[str, object]] = None,
     ) -> dict[str, Any]:
+        player = self._canonicalize_player(player)
         sample = {
             "t_ref_ns": int(t_ref_ns),
             "extra": dict(extra or {}),
@@ -1098,6 +1154,7 @@ class PupilBridge:
         mapping_version: int,
         extra: Optional[Dict[str, object]] = None,
     ) -> dict[str, Any]:
+        player = self._canonicalize_player(player)
         refinement = {
             "t_ref_ns": int(t_ref_ns),
             "confidence": float(confidence),
