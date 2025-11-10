@@ -27,6 +27,7 @@ from kivy.properties import (
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.modalview import ModalView
 from kivy.uix.textinput import TextInput
+from kivy.factory import Factory  # ensure UI classes resolve via KV Factory (change)
 
 from tabletop.data.blocks import load_blocks, load_csv_rounds, value_to_card_path
 from tabletop.data.config import ARUCO_OVERLAY_PATH, ROOT, load_tracker_hosts
@@ -123,32 +124,6 @@ if TYPE_CHECKING:
 ui_widgets.ASSETS = ASSETS
 
 STATE_FIELD_NAMES = set(TabletopState.__dataclass_fields__)
-
-
-class TrackerHostDialog(ModalView):
-    vp1 = StringProperty("")
-    vp2 = StringProperty("")
-    error_message = StringProperty("")
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.register_event_type("on_save")
-
-    def confirm(self) -> None:
-        vp1_value = ""
-        vp2_value = ""
-        with suppress(Exception):
-            widget = self.ids.get("vp1_input")
-            if widget is not None:
-                vp1_value = widget.text.strip()
-        with suppress(Exception):
-            widget = self.ids.get("vp2_input")
-            if widget is not None:
-                vp2_value = widget.text.strip()
-        self.dispatch("on_save", vp1_value, vp2_value)
-
-    def on_save(self, _vp1: str, _vp2: str) -> None:  # pragma: no cover - event hook
-        return None
 
 
 class _AsyncMarkerBridge:
@@ -324,7 +299,7 @@ class TabletopRoot(FloatLayout):
         self._heartbeat_label = "sync.heartbeat"
         self._heartbeat_counter = 0
         self._origin_device_id = "host_ui"
-        self._tracker_settings_dialog: Optional[TrackerHostDialog] = None
+        self._tracker_settings_dialog: Optional[ModalView] = None  # KV-driven dialog reference. (change)
         self._tracker_hosts_path = Path(ROOT) / "tracker_hosts.txt"
         self._tracker_host_pattern = re.compile(
             r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?::(?P<port>\d{1,5}))?$"
@@ -566,9 +541,17 @@ class TabletopRoot(FloatLayout):
             self._update_startup_status_ui()
             return
 
+        stop_recording = getattr(self._bridge, "stop_recording", None)
+        if not callable(stop_recording):
+            # Respect bridge devices that cannot stop recordings explicitly. (change)
+            self._bridge_recordings_active.clear()
+            self._bridge_recording_block = None
+            self._update_startup_status_ui()
+            return
+
         for player in list(self._bridge_recordings_active):
             try:
-                self._bridge.stop_recording(player)
+                stop_recording(player)
             finally:
                 self._bridge_recordings_active.discard(player)
 
@@ -1255,11 +1238,12 @@ class TabletopRoot(FloatLayout):
         if self._tracker_settings_dialog is not None:
             with suppress(Exception):
                 self._tracker_settings_dialog.dismiss()
-        dialog = TrackerHostDialog(
+        dialog = Factory.TrackerHostDialog(
             vp1=existing.get("VP1", ""),
             vp2=existing.get("VP2", ""),
             size_hint=(None, None),
         )
+        # Dialog now sourced from KV Factory; this avoids class duplication at import.
         width = max(420.0, min(self.width * 0.55, 820.0))
         height = max(320.0, min(self.height * 0.5, 520.0))
         dialog.size = (width, height)
@@ -1274,12 +1258,12 @@ class TabletopRoot(FloatLayout):
         Clock.schedule_once(_focus_vp1_input, 0)
         self._tracker_settings_dialog = dialog
 
-    def _clear_tracker_settings_dialog(self, dialog: TrackerHostDialog) -> None:
+    def _clear_tracker_settings_dialog(self, dialog: ModalView) -> None:
         if self._tracker_settings_dialog is dialog:
             self._tracker_settings_dialog = None
 
     def _handle_tracker_settings_save(
-        self, dialog: TrackerHostDialog, vp1_value: str, vp2_value: str
+        self, dialog: ModalView, vp1_value: str, vp2_value: str
     ) -> None:
         try:
             hosts = self._prepare_tracker_hosts(vp1_value, vp2_value)

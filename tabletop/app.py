@@ -235,6 +235,43 @@ class TabletopApp(App):
         os.environ["TABLETOP_DISPLAY_INDEX"] = str(display_index)
         os.environ["SDL_VIDEO_FULLSCREEN_DISPLAY"] = str(display_index)
 
+    def _safe_bootstrap_geometry(
+        self, display_index: int
+    ) -> tuple[int, dict[str, int]]:
+        """Return a clamped geometry ensuring the window starts on-screen."""
+
+        fallback_geometry = {"left": 100, "top": 100, "width": 1280, "height": 720}
+        screens = list(self._bootstrap_screens)
+        primary_screen = screens[0] if screens else None
+        if primary_screen and (
+            primary_screen.get("left", 0) < 0 or primary_screen.get("top", 0) < 0
+        ):
+            primary_screen = None
+
+        target = None
+        if 0 <= display_index < len(screens):
+            target = screens[display_index]
+
+        # Clamp invalid coordinates to a safe fallback (comment clarifies change).
+        if not target or target.get("left", 0) < 0 or target.get("top", 0) < 0:
+            display_index = 0
+            target = primary_screen or fallback_geometry
+            target = {
+                "left": int(target.get("left", fallback_geometry["left"])),
+                "top": int(target.get("top", fallback_geometry["top"])),
+                "width": int(target.get("width", fallback_geometry["width"])),
+                "height": int(target.get("height", fallback_geometry["height"])),
+            }
+        else:
+            target = {
+                "left": int(target.get("left", fallback_geometry["left"])),
+                "top": int(target.get("top", fallback_geometry["top"])),
+                "width": int(target.get("width", fallback_geometry["width"])),
+                "height": int(target.get("height", fallback_geometry["height"])),
+            }
+
+        return display_index, target
+
     def _configure_startup_display(self, display_index: int) -> None:
         """Prepare environment and Kivy configuration for the selected monitor."""
 
@@ -243,25 +280,26 @@ class TabletopApp(App):
         with suppress(Exception):
             Config.set("graphics", "display", str(display_index))
 
-        target_screen: Optional[dict[str, int]] = None
-        if 0 <= display_index < len(self._bootstrap_screens):
-            target_screen = self._bootstrap_screens[display_index]
-
-        if target_screen:
+        safe_index, target_screen = self._safe_bootstrap_geometry(display_index)
+        if safe_index != display_index:
+            # Sync the environment to the corrected display to avoid off-screen spawns.
+            self._apply_display_environment(safe_index)
             with suppress(Exception):
-                Config.set("graphics", "position", "custom")
-                Config.set("graphics", "left", str(target_screen["left"]))
-                Config.set("graphics", "top", str(target_screen["top"]))
-                Config.set("graphics", "width", str(target_screen["width"]))
-                Config.set("graphics", "height", str(target_screen["height"]))
-            log.info(
-                "Bootstrap configured for display %s at (%s, %s) size (%s x %s)",
-                display_index,
-                target_screen["left"],
-                target_screen["top"],
-                target_screen["width"],
-                target_screen["height"],
-            )
+                Config.set("graphics", "display", str(safe_index))
+        with suppress(Exception):
+            Config.set("graphics", "position", "custom")
+            Config.set("graphics", "left", str(target_screen["left"]))
+            Config.set("graphics", "top", str(target_screen["top"]))
+            Config.set("graphics", "width", str(target_screen["width"]))
+            Config.set("graphics", "height", str(target_screen["height"]))
+        log.info(
+            "Bootstrap configured for display %s at (%s, %s) size (%s x %s)",
+            safe_index,
+            target_screen["left"],
+            target_screen["top"],
+            target_screen["width"],
+            target_screen["height"],
+        )
 
         with suppress(Exception):
             Config.write()
@@ -344,7 +382,22 @@ class TabletopApp(App):
 
         # ESC binding is scheduled in ``on_start`` once the window exists.
         self.connection_ready = False
+        # After the widget tree exists, ensure the window is still visible. (change explained)
+        Clock.schedule_once(self._ensure_window_visible, 0.5)
         return root
+
+    def _ensure_window_visible(self, _dt: float) -> None:
+        """Move the window onscreen if it drifted to negative coordinates."""
+
+        try:
+            if getattr(Window, "left", 0) < 0 or getattr(Window, "top", 0) < 0:
+                with suppress(Exception):
+                    Window.position = "custom"
+                Window.left = 100
+                Window.top = 100
+                log.info("Window repositioned to keep it visible after startup")
+        except Exception:
+            log.debug("Failed to enforce visible window position", exc_info=True)
 
     # ------------------------------------------------------------------
     # Bridge helpers
@@ -738,9 +791,15 @@ class TabletopApp(App):
             except AttributeError:
                 pass
         elif self._bridge is not None:
+            stop_recording = getattr(self._bridge, "stop_recording", None)
+            if not callable(stop_recording):
+                # Respect device capabilities before issuing stop_recording. (change)
+                stop_recording = None
             for player in self._iter_active_players():
+                if stop_recording is None:
+                    break
                 try:
-                    self._bridge.stop_recording(player)
+                    stop_recording(player)
                 except Exception:  # pragma: no cover - defensive fallback
                     log.exception("Failed to stop recording for %s", player)
 
@@ -945,9 +1004,15 @@ def main(
     try:
         app.run()
     finally:
+        stop_recording = getattr(bridge, "stop_recording", None)
+        if not callable(stop_recording):
+            # Skip unsupported stop_recording calls to silence noisy warnings. (change)
+            stop_recording = None
         for tracked in desired_players:
+            if stop_recording is None:
+                break
             try:
-                bridge.stop_recording(tracked)
+                stop_recording(tracked)
             except Exception:  # pragma: no cover - defensive fallback
                 log.exception("Failed to stop recording during shutdown for %s", tracked)
         try:
